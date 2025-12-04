@@ -1,204 +1,114 @@
-import argparse
-import math
 import time
-from typing import Dict
+from dataclasses import asdict, dataclass
+from typing import Dict, Optional, Tuple
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
+import tyro
+import wandb
 
-from dataset import Dataset, DatasetConfig, IGNORE_LABEL_ID
 from varc import ARCViT
+from varc.dataset import Dataset, DatasetConfig, IGNORE_LABEL_ID
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="JAX/Equinox training for VARC.")
-    parser.add_argument("--data-root", type=str, default="data/arc1concept-aug-1000")
-    parser.add_argument("--train-split", type=str, default="train")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--epochs-per-iter", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=32, help="Global batch size.")
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--embed-dim", type=int, default=512)
-    parser.add_argument("--num-heads", type=int, default=8)
-    parser.add_argument("--depth", type=int, default=10)
-    parser.add_argument("--mlp-dim", type=int, default=2048)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--patch-size", type=int, default=1)
-    parser.add_argument("--num-task-tokens", type=int, default=1)
-    parser.add_argument("--num-colors", type=int, default=12)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--max-steps-per-epoch", type=int, default=None)
-    parser.add_argument("--image-size", type=int, default=30)
-    return parser.parse_args()
-
-
-def _prepare_batch(
-    batch: Dict[str, np.ndarray], image_size: int
-) -> Dict[str, jax.Array]:
-    inputs = batch["inputs"].numpy()
-    labels = batch["labels"].numpy()
-    mask = batch["attention_mask"].numpy().astype(np.bool_)
-    task_ids = batch["puzzle_identifiers"].numpy()
-
-    batch_size = inputs.shape[0]
-    inputs = inputs.reshape(batch_size, image_size, image_size)
-    labels = labels.reshape(batch_size, image_size, image_size)
-    mask = mask.reshape(batch_size, image_size, image_size)
-
-    return {
-        "inputs": jnp.array(inputs, dtype=jnp.int32),
-        "labels": jnp.array(labels, dtype=jnp.int32),
-        "attention_mask": jnp.array(mask, dtype=jnp.bool_),
-        "task_ids": jnp.array(task_ids, dtype=jnp.int32),
-    }
+@dataclass
+class Config:
+    data_root: str = "data/arc1concept-aug-1000"
+    train_split: str = "train"
+    epochs: int = 100
+    batch_size: int = 256
+    learning_rate: float = 3e-4
+    weight_decay: float = 0.0
+    embed_dim: int = 512
+    num_heads: int = 8
+    depth: int = 10
+    mlp_dim: int = 2048
+    dropout: float = 0.1
+    patch_size: int = 2
+    num_task_tokens: int = 1
+    seed: int = 0
+    log_every: int = 10
+    wandb_project: str = "varc-jax"
+    wandb_run_name: Optional[str] = None
+    max_grad_norm: float = 1.0
 
 
 def _shard_batch(batch: Dict[str, jax.Array], num_devices: int) -> Dict[str, jax.Array]:
     def _reshape(x):
-        leading = x.shape[0] // num_devices
-        return x.reshape(num_devices, leading, *x.shape[1:])
+        local_batch_size = x.shape[0] // num_devices
+        return x.reshape(num_devices, local_batch_size, *x.shape[1:])
 
     return jax.tree_util.tree_map(_reshape, batch)
 
 
-def _assert_no_none(tree, name: str):
-    def _check(x):
-        if x is None:
-            raise ValueError(f"Found None in {name}")
-        return x
+def loss_fn(
+    model: ARCViT, batch: Dict[str, jax.Array], key: jax.Array
+) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+    sample_keys = jax.random.split(key, batch["inputs"].shape[0])
 
-    return jax.tree_util.tree_map(_check, tree)
-
-
-def main() -> None:
-    args = parse_args()
-    devices = jax.local_devices()
-    num_devices = len(devices)
-    if args.batch_size % num_devices != 0:
-        raise ValueError(
-            f"Global batch size {args.batch_size} must be divisible by number of devices {num_devices}."
+    def forward_one(inp, task_id, mask, subkey):
+        return model(
+            inp,
+            task_id,
+            attention_mask=mask,
+            key=subkey,
+            inference=False,
         )
 
-    dataset_config = DatasetConfig(
-        seed=args.seed,
-        dataset_path=args.data_root,
-        global_batch_size=args.batch_size,
-        test_set_mode=False,
-        epochs_per_iter=args.epochs_per_iter,
+    logits = jax.vmap(forward_one)(
+        batch["inputs"], batch["task_ids"], batch["attention_mask"], sample_keys
     )
-    train_dataset = Dataset(dataset_config, split=args.train_split)
-    dataset_image_size = int(math.isqrt(train_dataset.metadata.seq_len))
-    if dataset_image_size * dataset_image_size != train_dataset.metadata.seq_len:
-        raise ValueError(
-            "Dataset sequence length must be a perfect square (unpatched pixels)."
-        )
 
-    image_size = args.image_size or dataset_image_size
-    if image_size != dataset_image_size:
-        raise ValueError(
-            f"Configured image_size={image_size} but dataset provides {dataset_image_size}x{dataset_image_size} pixels."
-        )
-    if image_size % args.patch_size != 0:
-        raise ValueError("image_size must be divisible by patch_size.")
+    logits_hw = jnp.transpose(logits, (0, 2, 3, 1))
+    logits_flat = logits_hw.reshape(-1, logits.shape[1])
+    labels_flat = batch["labels"].reshape(-1)
 
-    key = jax.random.PRNGKey(args.seed)
-    model_key, key = jax.random.split(key)
+    valid_mask = labels_flat != IGNORE_LABEL_ID
+    labels_masked = jnp.where(valid_mask, labels_flat, 0)
+    mask_float = valid_mask.astype(jnp.float32)
 
-    if args.num_colors != train_dataset.metadata.vocab_size:
-        raise ValueError(
-            f"num_colors ({args.num_colors}) must match dataset vocab size ({train_dataset.metadata.vocab_size})."
-        )
-
-    model = ARCViT(
-        num_tasks=train_dataset.metadata.num_puzzle_identifiers,
-        image_size=image_size,
-        num_colors=train_dataset.metadata.vocab_size,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        mlp_dim=args.mlp_dim,
-        dropout=args.dropout,
-        num_task_tokens=args.num_task_tokens,
-        patch_size=args.patch_size,
-        key=model_key,
+    per_elem_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits_flat, labels_masked
     )
-    params, static = eqx.partition(model, eqx.is_array)
 
-    optimizer = optax.adamw(
-        learning_rate=args.learning_rate, weight_decay=args.weight_decay
+    loss_sum = (per_elem_loss * mask_float).sum()
+    denom = jnp.maximum(mask_float.sum(), 1.0)
+    loss = loss_sum / denom
+
+    preds = jnp.argmax(logits, axis=1)
+    pred_flat = preds.reshape(-1)
+    correct = (pred_flat == labels_flat).astype(jnp.float32) * mask_float
+    pixel_acc = correct.sum() / denom
+
+    exact = jax.vmap(lambda p, l: jnp.all((p == l) | (l == IGNORE_LABEL_ID)))(
+        preds, batch["labels"]
     )
-    opt_state = optimizer.init(params)
+    exact_acc = exact.mean()
 
-    params = jax.device_put_replicated(params, devices)
-    static = jax.device_put_replicated(static, devices)
-    opt_state = jax.device_put_replicated(opt_state, devices)
+    return loss, {"loss": loss, "pixel_acc": pixel_acc, "exact_acc": exact_acc}
 
-    def loss_and_metrics(model, batch, key):
-        sample_keys = jax.random.split(key, batch["inputs"].shape[0])
 
-        def forward_one(inp, task_id, mask, subkey):
-            return model(
-                inp,
-                task_id,
-                attention_mask=mask,
-                key=subkey,
-                inference=False,
-            )
-
-        logits = jax.vmap(forward_one)(
-            batch["inputs"], batch["task_ids"], batch["attention_mask"], sample_keys
-        )
-        logits_hw = jnp.transpose(logits, (0, 2, 3, 1))  # (B, H, W, C)
-        logits_flat = logits_hw.reshape(-1, logits.shape[1])
-        labels_flat = batch["labels"].reshape(-1)
-        valid_mask = (labels_flat != IGNORE_LABEL_ID).astype(jnp.float32)
-        labels_masked = jnp.where(valid_mask.astype(bool), labels_flat, 0)
-
-        per_elem_loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits_flat, labels_masked
-        )
-        loss_sum = (per_elem_loss * valid_mask).sum()
-        denom = jnp.maximum(valid_mask.sum(), 1.0)
-        loss = loss_sum / denom
-
-        preds = jnp.argmax(logits, axis=1)
-        pred_flat = preds.reshape(-1)
-        correct = (pred_flat == labels_flat).astype(jnp.float32) * valid_mask
-        pixel_acc = correct.sum() / denom
-        exact = jax.vmap(lambda p, l: jnp.all((p == l) | (l == IGNORE_LABEL_ID)))(
-            preds, batch["labels"]
-        )
-        exact_acc = exact.mean()
-
-        metrics = {
-            "loss": loss,
-            "pixel_acc": pixel_acc,
-            "exact_acc": exact_acc,
-        }
-        return loss, metrics
-
-    def train_step(params, static, opt_state, batch, key):
-        def loss_fn(p, batch, subkey):
+def make_train_step(optimizer: optax.GradientTransformation):
+    def train_step(
+        params: ARCViT,
+        static: ARCViT,
+        opt_state: optax.OptState,
+        batch: Dict[str, jax.Array],
+        key: jax.Array,
+    ) -> Tuple[ARCViT, ARCViT, optax.OptState, Dict[str, jax.Array]]:
+        def compute_loss(p):
             mdl = eqx.combine(p, static)
-            return loss_and_metrics(mdl, batch, subkey)
+            return loss_fn(mdl, batch, key)
 
-        (loss, metrics), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
-            params, batch, key
+        (loss, metrics), grads = eqx.filter_value_and_grad(compute_loss, has_aux=True)(
+            params
         )
 
         grads = jax.lax.pmean(grads, axis_name="devices")
-        metrics = jax.tree_util.tree_map(
-            lambda x: jax.lax.pmean(x, axis_name="devices"), metrics
-        )
         loss = jax.lax.pmean(loss, axis_name="devices")
-
-        _assert_no_none(grads, "grads")
-        _assert_no_none(opt_state, "opt_state")
+        metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "devices"), metrics)
 
         updates, opt_state = optimizer.update(grads, opt_state, params=params)
         params = eqx.apply_updates(params, updates)
@@ -206,42 +116,117 @@ def main() -> None:
         metrics["loss"] = loss
         return params, static, opt_state, metrics
 
+    return train_step
+
+
+def main(config: Config) -> None:
+    devices = jax.local_devices()
+    num_devices = len(devices)
+
+    key = jax.random.PRNGKey(config.seed)
+    model_key, train_key = jax.random.split(key)
+
+    dataset_config = DatasetConfig(
+        seed=config.seed,
+        dataset_path=config.data_root,
+        global_batch_size=config.batch_size,
+    )
+    train_dataset = Dataset(dataset_config, split=config.train_split)
+    image_size = train_dataset.image_size
+
+    model = ARCViT(
+        num_tasks=train_dataset.metadata.num_puzzle_identifiers,
+        image_size=image_size,
+        num_colors=train_dataset.metadata.vocab_size,
+        embed_dim=config.embed_dim,
+        depth=config.depth,
+        num_heads=config.num_heads,
+        mlp_dim=config.mlp_dim,
+        dropout=config.dropout,
+        num_task_tokens=config.num_task_tokens,
+        patch_size=config.patch_size,
+        key=model_key,
+    )
+
+    params, static = eqx.partition(model, eqx.is_array)
+
+    total_items = len(train_dataset)
+    steps_per_epoch = total_items // config.batch_size
+    total_steps = config.epochs * steps_per_epoch
+    warmup_epochs = min(config.epochs // 5, 10)
+    warmup_steps = warmup_epochs * steps_per_epoch
+
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=config.learning_rate,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,
+        end_value=0.0,
+    )
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adamw(learning_rate=lr_schedule, weight_decay=config.weight_decay),
+    )
+    opt_state = optimizer.init(params)
+
+    params = jax.device_put_replicated(params, devices)
+    static = jax.device_put_replicated(static, devices)
+    opt_state = jax.device_put_replicated(opt_state, devices)
+
+    train_step = make_train_step(optimizer)
     p_train_step = jax.pmap(train_step, axis_name="devices")
 
+    if config.wandb_project:
+        wandb.init(
+            project=config.wandb_project,
+            name=config.wandb_run_name,
+            config=asdict(config),
+        )
+
     global_step = 0
-    for epoch in range(1, args.epochs + 1):
-        step_in_epoch = 0
+
+    for epoch in range(1, config.epochs + 1):
         epoch_start = time.time()
-        for set_name, raw_batch, _ in train_dataset:
-            batch = _prepare_batch(raw_batch, image_size=image_size)
+
+        for step, batch in enumerate(train_dataset):
             shard = _shard_batch(batch, num_devices=num_devices)
 
-            step_key, key = jax.random.split(key)
-            step_keys = jax.random.split(step_key, num_devices)
+            train_key, step_key = jax.random.split(train_key)
+            device_keys = jax.random.split(step_key, num_devices)
 
             params, static, opt_state, metrics = p_train_step(
-                params, static, opt_state, shard, step_keys
+                params, static, opt_state, shard, device_keys
             )
-            host_metrics = jax.tree_util.tree_map(lambda x: float(x[0]), metrics)
 
+            current_lr = lr_schedule(global_step)
+            host_metrics = jax.tree_util.tree_map(lambda x: float(x[0]), metrics)
             global_step += 1
-            step_in_epoch += 1
-            if step_in_epoch % args.log_every == 0:
-                print(
-                    f"epoch={epoch} step={step_in_epoch} "
-                    f"loss={host_metrics['loss']:.4f} "
-                    f"pixel_acc={host_metrics['pixel_acc']:.4f} "
-                    f"exact_acc={host_metrics['exact_acc']:.4f}"
+
+            if step % config.log_every == 0:
+                wandb.log(
+                    {
+                        "train/loss": host_metrics["loss"],
+                        "train/pixel_acc": host_metrics["pixel_acc"],
+                        "train/exact_acc": host_metrics["exact_acc"],
+                        "train/lr": current_lr,
+                        "epoch": epoch,
+                        "global_step": global_step,
+                    },
+                    step=global_step,
                 )
 
-            if args.max_steps_per_epoch and step_in_epoch >= args.max_steps_per_epoch:
-                break
-
         epoch_time = time.time() - epoch_start
-        print(
-            f"Finished epoch {epoch} | steps={step_in_epoch} | time={epoch_time:.1f}s"
+        wandb.log(
+            {
+                "epoch": epoch,
+                "epoch_time": epoch_time,
+            },
+            step=global_step,
         )
+
+    wandb.finish()
 
 
 if __name__ == "__main__":
-    main()
+    main(tyro.cli(Config))
