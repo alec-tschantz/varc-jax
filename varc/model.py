@@ -57,9 +57,28 @@ class ARCViT(eqx.Module):
         ) = jax.random.split(key, 6)
 
         self.color_embed = eqx.nn.Embedding(num_colors, embed_dim, key=color_key)
+        w_color = (
+            jax.random.truncated_normal(
+                color_key, lower=-2.0, upper=2.0, shape=self.color_embed.weight.shape
+            )
+            * 0.02
+        )
+        self.color_embed = eqx.tree_at(lambda m: m.weight, self.color_embed, w_color)
 
         self.task_token_embed = eqx.nn.Embedding(
             num_tasks, embed_dim * num_task_tokens, key=task_key
+        )
+        w_task = (
+            jax.random.truncated_normal(
+                task_key,
+                lower=-2.0,
+                upper=2.0,
+                shape=self.task_token_embed.weight.shape,
+            )
+            * 0.02
+        )
+        self.task_token_embed = eqx.tree_at(
+            lambda m: m.weight, self.task_token_embed, w_task
         )
 
         self.patch_embed = PatchEmbed(
@@ -90,6 +109,8 @@ class ARCViT(eqx.Module):
         self.norm = eqx.nn.LayerNorm(embed_dim, use_weight=True, use_bias=True)
 
         self.head = eqx.nn.Linear(embed_dim, num_colors * (patch_size**2), key=head_key)
+        b_head = jnp.zeros_like(self.head.bias)
+        self.head = eqx.tree_at(lambda m: m.bias, self.head, b_head)
 
         self.dropout = eqx.nn.Dropout(dropout)
 
@@ -121,17 +142,14 @@ class ARCViT(eqx.Module):
 
         color_lookup = jax.vmap(jax.vmap(self.color_embed))
         embedded = color_lookup(pixels.astype(jnp.int32))
-
         embedded = jnp.transpose(embedded, (2, 0, 1))
 
         patch_tokens = self.patch_embed(embedded)
         patch_tokens = patch_tokens + self.positional_embed
-
         task_tokens = self.task_token_embed(task_id.astype(jnp.int32))
         task_tokens = task_tokens.reshape(self.num_task_tokens, -1)
 
         hidden_states = jnp.concatenate([task_tokens, patch_tokens], axis=0)
-
         hidden_states = self.dropout(
             hidden_states, key=drop_key, inference=dropout_inference
         )
@@ -147,7 +165,7 @@ class ARCViT(eqx.Module):
             inference=inference,
         )
 
-        norm_all = jax.vmap(self.norm)(encoded)
+        encoded = jax.vmap(self.norm)(encoded)
         patch_states = encoded[self.num_task_tokens :, :]
         logits_flat = jax.vmap(self.head)(patch_states)
 

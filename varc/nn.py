@@ -6,8 +6,10 @@ import jax.numpy as jnp
 
 
 def _rotate_half(x: jax.Array) -> jax.Array:
-    x1, x2 = jnp.split(x, 2, axis=-1)
-    return jnp.concatenate([-x2, x1], axis=-1)
+    x = x.reshape(*x.shape[:-1], -1, 2)
+    x1, x2 = x[..., 0], x[..., 1]
+    res = jnp.stack([-x2, x1], axis=-1)
+    return res.reshape(*res.shape[:-2], -1)
 
 
 class RotaryEmbedding(eqx.Module):
@@ -19,14 +21,10 @@ class RotaryEmbedding(eqx.Module):
         freqs = 1.0 / (
             10000.0 ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / float(dim))
         )
-        t = (
-            jnp.arange(pt_seq_len, dtype=jnp.float32)
-            / float(pt_seq_len)
-            * float(pt_seq_len)
-        )
+        t = jnp.arange(pt_seq_len, dtype=jnp.float32)
+
         freqs_1d = jnp.einsum("i,f->if", t, freqs)
         freqs_1d = jnp.repeat(freqs_1d, 2, axis=-1)
-
         freqs_h = freqs_1d[:, None, :]
         freqs_w = freqs_1d[None, :, :]
 
@@ -50,8 +48,8 @@ class RotaryEmbedding(eqx.Module):
             return t
 
         head_dim = t.shape[2]
-        cos = self.freqs_cos[:usable, :head_dim]
-        sin = self.freqs_sin[:usable, :head_dim]
+        cos = jax.lax.stop_gradient(self.freqs_cos[:usable, :head_dim])
+        sin = jax.lax.stop_gradient(self.freqs_sin[:usable, :head_dim])
 
         to_rotate = t[:, self.task_rope_tokens :, :head_dim]
         rotated = to_rotate * cos + _rotate_half(to_rotate) * sin
@@ -67,6 +65,7 @@ class PatchEmbed(eqx.Module):
     conv: eqx.nn.Conv2d
     grid: int = eqx.field(static=True)
     embed_dim: int = eqx.field(static=True)
+    patch_size: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -78,6 +77,8 @@ class PatchEmbed(eqx.Module):
     ):
         self.grid = image_size // patch_size
         self.embed_dim = embed_dim
+        self.patch_size = patch_size
+
         self.conv = eqx.nn.Conv2d(
             in_channels=embed_dim,
             out_channels=embed_dim,
@@ -147,6 +148,7 @@ class Attention(eqx.Module):
 
         qkv = jax.vmap(self.qkv)(x)
         qkv = qkv.reshape(seq_len, 3, self.num_heads, self.head_dim)
+
         qkv = jnp.transpose(qkv, (1, 2, 0, 3))
         q, k, v = qkv[0], qkv[1], qkv[2]
 
@@ -169,7 +171,6 @@ class Attention(eqx.Module):
 
         context = jnp.einsum("hij,hjd->hid", attn_weights, v)
         context = jnp.transpose(context, (1, 0, 2)).reshape(seq_len, -1)
-
         context = jax.vmap(self.proj)(context)
         context = self.proj_dropout(context, key=proj_key, inference=dropout_inference)
 
