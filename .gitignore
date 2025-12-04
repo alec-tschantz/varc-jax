@@ -1,0 +1,6 @@
+.DS_Store
+data/
+outputs/
+wandb/
+checkpoints/
+__pycache__/
