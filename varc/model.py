@@ -94,12 +94,6 @@ class ARCViT(eqx.Module):
         self.dropout = eqx.nn.Dropout(dropout)
 
     def _token_mask(self, attention_mask: jax.Array) -> jax.Array:
-        if attention_mask.shape != (self.image_size, self.image_size):
-            raise ValueError(
-                f"`attention_mask` must be {(self.image_size, self.image_size)}, "
-                f"got {attention_mask.shape}."
-            )
-
         mask_grid = attention_mask.reshape(
             self.token_grid,
             self.patch_size,
@@ -133,9 +127,8 @@ class ARCViT(eqx.Module):
         patch_tokens = self.patch_embed(embedded)
         patch_tokens = patch_tokens + self.positional_embed
 
-        task_tokens = self.task_token_embed(task_id.astype(jnp.int32)).reshape(
-            self.num_task_tokens, -1
-        )
+        task_tokens = self.task_token_embed(task_id.astype(jnp.int32))
+        task_tokens = task_tokens.reshape(self.num_task_tokens, -1)
 
         hidden_states = jnp.concatenate([task_tokens, patch_tokens], axis=0)
 
@@ -143,22 +136,19 @@ class ARCViT(eqx.Module):
             hidden_states, key=drop_key, inference=dropout_inference
         )
 
-        key_padding_mask = (
+        attention_mask = (
             self._token_mask(attention_mask) if attention_mask is not None else None
         )
 
         encoded = self.encoder(
             hidden_states,
-            key_padding_mask=key_padding_mask,
+            attention_mask=attention_mask,
             key=enc_key,
             inference=inference,
         )
 
-        norm_all = jax.vmap(self.norm)
-        encoded = norm_all(encoded)
-
+        norm_all = jax.vmap(self.norm)(encoded)
         patch_states = encoded[self.num_task_tokens :, :]
-
         logits_flat = jax.vmap(self.head)(patch_states)
 
         logits = logits_flat.reshape(
@@ -171,5 +161,4 @@ class ARCViT(eqx.Module):
         logits = jnp.transpose(logits, (0, 2, 1, 3, 4))
         logits = logits.reshape(self.image_size, self.image_size, self.num_colors)
         logits = jnp.transpose(logits, (2, 0, 1))
-
         return logits

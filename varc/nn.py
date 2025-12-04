@@ -76,8 +76,6 @@ class PatchEmbed(eqx.Module):
         *,
         key: jax.Array,
     ):
-        if image_size % patch_size != 0:
-            raise ValueError("image_size must be divisible by patch_size.")
         self.grid = image_size // patch_size
         self.embed_dim = embed_dim
         self.conv = eqx.nn.Conv2d(
@@ -139,7 +137,7 @@ class Attention(eqx.Module):
         self,
         x: jax.Array,
         *,
-        key_padding_mask: Optional[jax.Array],
+        attention_mask: Optional[jax.Array],
         key: Optional[jax.Array],
         inference: bool,
     ) -> jax.Array:
@@ -157,9 +155,9 @@ class Attention(eqx.Module):
 
         attn_scores = jnp.einsum("hld,hmd->hlm", q, k) * self.scale
 
-        if key_padding_mask is not None:
+        if attention_mask is not None:
             attn_scores = jnp.where(
-                key_padding_mask[None, None, :],
+                attention_mask[None, None, :],
                 attn_scores,
                 jnp.finfo(attn_scores.dtype).min,
             )
@@ -224,7 +222,7 @@ class Block(eqx.Module):
         self,
         x: jax.Array,
         *,
-        key_padding_mask: Optional[jax.Array],
+        attention_mask: Optional[jax.Array],
         key: Optional[jax.Array],
         inference: bool,
     ) -> jax.Array:
@@ -233,7 +231,7 @@ class Block(eqx.Module):
 
         residual = x
         attn_out = self.attn(
-            x, key_padding_mask=key_padding_mask, key=keys[0], inference=inference
+            x, attention_mask=attention_mask, key=keys[0], inference=inference
         )
         attn_out = self.dropout1(attn_out, key=keys[1], inference=dropout_inference)
         x = residual + attn_out
@@ -287,7 +285,7 @@ class Transformer(eqx.Module):
         self,
         x: jax.Array,
         *,
-        key_padding_mask: Optional[jax.Array],
+        attention_mask: Optional[jax.Array],
         key: Optional[jax.Array],
         inference: bool,
     ) -> jax.Array:
@@ -298,7 +296,6 @@ class Transformer(eqx.Module):
         )
         for layer, layer_key in zip(self.layers, layer_keys):
             x = layer(
-                x, key_padding_mask=key_padding_mask, key=layer_key, inference=inference
+                x, attention_mask=attention_mask, key=layer_key, inference=inference
             )
         return x
-
