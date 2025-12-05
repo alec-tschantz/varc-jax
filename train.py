@@ -30,7 +30,7 @@ class Config:
     num_task_tokens: int = 1
     dtype: str = "bfloat16"
     seed: int = 0
-    log_every: int = 50
+    log_every: int = 10
     wandb_project: str = "varc-jax"
     wandb_run_name: Optional[str] = None
     max_grad_norm: float = 1.0
@@ -159,7 +159,7 @@ def evaluate_model(
     metrics_sum = None
 
     for batch in eval_dataset:
-        shard = _shard_batch(batch, num_devices)
+        shard = shard_batch(batch, num_devices)
 
         eval_key, step_key = jax.random.split(eval_key)
         device_keys = jax.random.split(step_key, num_devices)
@@ -199,7 +199,7 @@ def create_datasets(config: Config):
     return train_dataset, eval_dataset
 
 
-def _shard_batch(batch: Dict[str, jax.Array], num_devices: int) -> Dict[str, jax.Array]:
+def shard_batch(batch: Dict[str, jax.Array], num_devices: int) -> Dict[str, jax.Array]:
     def _reshape(x):
         local_batch_size = x.shape[0] // num_devices
         return x.reshape(num_devices, local_batch_size, *x.shape[1:])
@@ -285,7 +285,7 @@ def main(config: Config) -> None:
         epoch_start = time.time()
 
         for step, batch in enumerate(train_dataset):
-            shard = _shard_batch(batch, num_devices=num_devices)
+            shard = shard_batch(batch, num_devices=num_devices)
 
             train_key, step_key = jax.random.split(train_key)
             device_keys = jax.random.split(step_key, num_devices)
