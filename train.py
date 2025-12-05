@@ -69,9 +69,11 @@ def loss_fn(
     )
 
     loss_sum = (per_elem_loss * mask_float).sum()
-    loss = loss_sum / jnp.maximum(mask_float.sum(), 1.0)
+    denom = jnp.maximum(mask_float.sum(), 1.0)
+    loss = loss_sum / denom
 
-    pred_flat = jnp.argmax(logits, axis=1).reshape(-1)
+    preds = jnp.argmax(logits, axis=1)
+    pred_flat = preds.reshape(-1)
     correct = (pred_flat == labels_flat).astype(jnp.float32) * mask_float
     pixel_acc = correct.sum() / denom
 
@@ -357,7 +359,6 @@ def main(config: Config) -> None:
         params_host = jax.tree.map(lambda x: x[0], params)
         ckpt_path = os.path.join("checkpoints", f"{config.wandb_project}.eqx")
         eqx.tree_serialise_leaves(ckpt_path, eqx.combine(params_host, static))
-
 
         wandb.log(
             {
