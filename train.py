@@ -68,11 +68,9 @@ def loss_fn(
     )
 
     loss_sum = (per_elem_loss * mask_float).sum()
-    denom = jnp.maximum(mask_float.sum(), 1.0)
-    loss = loss_sum / denom
+    loss = loss_sum / jnp.maximum(mask_float.sum(), 1.0)
 
-    preds = jnp.argmax(logits, axis=1)
-    pred_flat = preds.reshape(-1)
+    pred_flat = jnp.argmax(logits, axis=1).reshape(-1)
     correct = (pred_flat == labels_flat).astype(jnp.float32) * mask_float
     pixel_acc = correct.sum() / denom
 
@@ -103,8 +101,7 @@ def make_train_step(optimizer: optax.GradientTransformation, config: Config):
         batch = train_augment_batch(aug_key, raw_batch)
 
         def compute_loss(p):
-            model = eqx.combine(p, static)
-            return loss_fn(model, batch, model_key, inference=False)
+            return loss_fn(eqx.combine(p, static), batch, model_key, inference=False)
 
         grad_fn = eqx.filter_value_and_grad(compute_loss, has_aux=True)
         (loss, metrics), grads = grad_fn(params)
@@ -138,9 +135,9 @@ def make_eval_step(config: Config):
     ) -> Dict[str, jax.Array]:
         aug_key, model_key = jax.random.split(key)
         batch = eval_augment_batch(aug_key, raw_batch)
-
-        model = eqx.combine(params, static)
-        _, metrics = loss_fn(model, batch, model_key, inference=True)
+        _, metrics = loss_fn(
+            eqx.combine(params, static), batch, model_key, inference=True
+        )
         return jax.tree.map(lambda x: jax.lax.pmean(x, "devices"), metrics)
 
     return eval_step
@@ -195,8 +192,7 @@ def make_augment_batch(
         key: jax.Array,
         batch: Dict[str, jax.Array],
     ) -> Dict[str, jax.Array]:
-        bsz = batch["inputs"].shape[0]
-        keys = jax.random.split(key, bsz)
+        keys = jax.random.split(key, batch["inputs"].shape[0])
 
         aug_out = vmap_augment(
             keys,
@@ -243,8 +239,7 @@ def create_datasets(config: Config):
 
 def shard_batch(batch: Dict[str, jax.Array], num_devices: int) -> Dict[str, jax.Array]:
     def _reshape(x):
-        local_batch_size = x.shape[0] // num_devices
-        return x.reshape(num_devices, local_batch_size, *x.shape[1:])
+        return x.reshape(num_devices, x.shape[0] // num_devices, *x.shape[1:])
 
     return jax.tree_util.tree_map(_reshape, batch)
 
@@ -273,16 +268,11 @@ def main(config: Config) -> None:
         key=model_key,
     )
 
-    steps_per_epoch = len(train_dataset)
-    total_steps = config.epochs * steps_per_epoch
-    warmup_epochs = min(config.epochs // 5, 10)
-    warmup_steps = warmup_epochs * steps_per_epoch
-
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=config.learning_rate,
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps,
+        warmup_steps=min(config.epochs // 5, 10) * len(train_dataset),
+        decay_steps=config.epochs * len(train_dataset),
         end_value=0.0,
     )
 
@@ -309,16 +299,17 @@ def main(config: Config) -> None:
         config=asdict(config),
     )
 
-    dataset_metrics = {
-        "data/num_train_tasks": train_dataset.num_tasks,
-        "data/num_train_examples": train_dataset.num_samples,
-        "data/train_batches_per_epoch": len(train_dataset),
-        "data/train_total_steps": len(train_dataset) * config.epochs,
-        "data/num_eval_tasks": eval_dataset.num_tasks,
-        "data/num_eval_examples": eval_dataset.num_samples,
-        "data/eval_batches_per_epoch": len(eval_dataset),
-    }
-    wandb.log(dataset_metrics)
+    wandb.log(
+        {
+            "data/num_train_tasks": train_dataset.num_tasks,
+            "data/num_train_examples": train_dataset.num_samples,
+            "data/train_batches_per_epoch": len(train_dataset),
+            "data/train_total_steps": len(train_dataset) * config.epochs,
+            "data/num_eval_tasks": eval_dataset.num_tasks,
+            "data/num_eval_examples": eval_dataset.num_samples,
+            "data/eval_batches_per_epoch": len(eval_dataset),
+        }
+    )
 
     global_step = 0
     for epoch in range(1, config.epochs + 1):
@@ -361,15 +352,15 @@ def main(config: Config) -> None:
             num_devices,
         )
 
-        log_metrics = {
-            "epoch": epoch,
-            "epoch_time": epoch_time,
-            "global_step": global_step,
-        }
-        for k, v in eval_metrics.items():
-            log_metrics[f"eval/{k}"] = v
-
-        wandb.log(log_metrics, step=global_step)
+        wandb.log(
+            {
+                "epoch": epoch,
+                "epoch_time": epoch_time,
+                "global_step": global_step,
+                **{f"eval/{k}": v for k, v in eval_metrics.items()},
+            },
+            step=global_step,
+        )
 
     wandb.finish()
 
