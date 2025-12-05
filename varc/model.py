@@ -114,31 +114,60 @@ class ARCViT(eqx.Module):
         key: Optional[jax.Array] = None,
         inference: bool = False,
     ) -> Float[Array, "B C H W"]:
+        """
+        Shapes:
+            B: batch size
+            H, W: image height/width
+            E: embedding dim
+            T: number of task tokens
+            S: number of input tokens (grid size x grid size)
+            C: number of output colors
+            P: patch_size
+            G: grid_size = height // patch_size
+        """
+
         drop_key, enc_key = (None, None) if key is None else jax.random.split(key)
         inference = inference or key is None
 
         batch_size = pixels.shape[0]
+
+        # (B, H, W, E)
         color_lookup = jax.vmap(jax.vmap(jax.vmap(self.color_embed)))
         embedded = color_lookup(pixels.astype(jnp.int32))
         embedded = embedded.astype(self.dtype)
+
+        # (B, E, H, W)
         embedded = jnp.transpose(embedded, (0, 3, 1, 2))
 
+        # (B, S, E)
         patch_tokens = jax.vmap(self.patch_embed)(embedded)
         patch_tokens = patch_tokens.astype(self.dtype)
+
+        # (1, S, E)
         pos_embed = self.positional_embed[None, :, :].astype(self.dtype)
+
+        # (B, S, E)
         patch_tokens = patch_tokens + pos_embed
 
+        # (B, T*E)
         task_tokens = jax.vmap(self.task_token_embed)(task_id.astype(jnp.int32))
+
+        # (B, T, E)
         task_tokens = task_tokens.reshape(batch_size, self.num_task_tokens, -1)
         task_tokens = task_tokens.astype(self.dtype)
 
+        # (B, T+S, E)
         hidden_states = jnp.concatenate([task_tokens, patch_tokens], axis=1)
+
+        # (B, T+S, E)
         hidden_states = self.dropout(hidden_states, key=drop_key, inference=inference)
 
+        # (B, T+S)
         attention_mask = (
             self._token_mask(attention_mask) if attention_mask is not None else None
         )
 
+        # (B, T+S, E)
         encoded = self.encoder(
             hidden_states,
             attention_mask=attention_mask,
@@ -146,11 +175,17 @@ class ARCViT(eqx.Module):
             inference=inference,
         )
 
+        # (B, T+S, E)
         norm = jax.vmap(jax.vmap(self.norm))
         encoded = norm(encoded)
+
+        # (B, S, E)
         patch_states = encoded[:, self.num_task_tokens :, :]
+
+        # (B, S, P*P*C)
         logits_flat = jax.vmap(jax.vmap(self.head))(patch_states).astype(jnp.float32)
 
+        # (B, G, G, P, P, C)
         logits = logits_flat.reshape(
             batch_size,
             self.token_grid,
@@ -159,10 +194,16 @@ class ARCViT(eqx.Module):
             self.patch_size,
             self.num_colors,
         )
+
+        # (B, G, P, G, P, C)
         logits = jnp.transpose(logits, (0, 1, 3, 2, 4, 5))
+
+        # (B, H, W, C)
         logits = logits.reshape(
             batch_size, self.image_size, self.image_size, self.num_colors
         )
+
+        # (B, C, H, W)
         logits = jnp.transpose(logits, (0, 3, 1, 2))
         return logits
 
