@@ -10,7 +10,7 @@ import optax
 import tyro
 import wandb
 
-from varc import ARCViT, Dataset, IGNORE_INDEX
+from varc import ARCViT, Dataset, IGNORE_INDEX, make_augment_batch
 
 
 @dataclass
@@ -45,6 +45,7 @@ def loss_fn(
     key: jax.Array,
     inference: bool,
 ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+
     logits = model(
         batch["inputs"],
         batch["task_ids"],
@@ -81,17 +82,29 @@ def loss_fn(
     return loss, metrics
 
 
-def make_train_step(optimizer: optax.GradientTransformation):
+def make_train_step(optimizer: optax.GradientTransformation, config: Config):
+    train_augment_batch = make_augment_batch(
+        max_size=config.image_size,
+        resolution_enabled=True,
+        translation_enabled=True,
+        fix_scale_factor=2,
+    )
+
     def train_step(
         params: ARCViT,
         static: ARCViT,
         opt_state: optax.OptState,
-        batch: Dict[str, jax.Array],
+        raw_batch: Dict[str, jax.Array],
         key: jax.Array,
     ) -> Tuple[ARCViT, ARCViT, optax.OptState, Dict[str, jax.Array]]:
+
+        aug_key, model_key = jax.random.split(key)
+
+        batch = train_augment_batch(aug_key, raw_batch)
+
         def compute_loss(p):
             model = eqx.combine(p, static)
-            return loss_fn(model, batch, key, inference=False)
+            return loss_fn(model, batch, model_key, inference=False)
 
         (loss, metrics), grads = eqx.filter_value_and_grad(compute_loss, has_aux=True)(
             params
@@ -110,15 +123,29 @@ def make_train_step(optimizer: optax.GradientTransformation):
     return train_step
 
 
-def eval_step(
-    params: ARCViT,
-    static: ARCViT,
-    batch: Dict[str, jax.Array],
-    key: jax.Array,
-) -> Dict[str, jax.Array]:
-    model = eqx.combine(params, static)
-    _, metrics = loss_fn(model, batch, key, inference=True)
-    return jax.tree.map(lambda x: jax.lax.pmean(x, "devices"), metrics)
+def make_eval_step(config: Config):
+    eval_augment_batch = make_augment_batch(
+        max_size=config.image_size,
+        resolution_enabled=False,
+        translation_enabled=False,
+        fix_scale_factor=2,
+    )
+
+    def eval_step(
+        params: ARCViT,
+        static: ARCViT,
+        raw_batch: Dict[str, jax.Array],
+        key: jax.Array,
+    ) -> Dict[str, jax.Array]:
+        aug_key, model_key = jax.random.split(key)
+
+        batch = eval_augment_batch(aug_key, raw_batch)
+
+        model = eqx.combine(params, static)
+        _, metrics = loss_fn(model, batch, model_key, inference=True)
+        return jax.tree.map(lambda x: jax.lax.pmean(x, "devices"), metrics)
+
+    return eval_step
 
 
 def evaluate_model(
@@ -157,11 +184,7 @@ def create_datasets(config: Config):
         subset="train",
         max_size=config.image_size,
         task_lookup=None,
-        translation_enabled=True,
-        resolution_enabled=True,
-        fix_scale_factor=2,
         batch_size=config.batch_size,
-        shuffle=True,
     )
 
     eval_dataset = Dataset(
@@ -170,11 +193,7 @@ def create_datasets(config: Config):
         subset="test",
         max_size=config.image_size,
         task_lookup=train_dataset.task_lookup,
-        translation_enabled=False,
-        resolution_enabled=False,
-        fix_scale_factor=2,
         batch_size=config.batch_size,
-        shuffle=True,
     )
 
     return train_dataset, eval_dataset
@@ -238,8 +257,10 @@ def main(config: Config) -> None:
     static = jax.device_put_replicated(static, devices)
     opt_state = jax.device_put_replicated(opt_state, devices)
 
-    train_step = make_train_step(optimizer)
+    train_step = make_train_step(optimizer, config)
     p_train_step = jax.pmap(train_step, axis_name="devices")
+
+    eval_step = make_eval_step(config)
     p_eval_step = jax.pmap(eval_step, axis_name="devices")
 
     wandb.init(
@@ -250,11 +271,11 @@ def main(config: Config) -> None:
 
     dataset_metrics = {
         "data/num_train_tasks": train_dataset.num_tasks,
-        "data/num_train_examples": len(train_dataset.samples),
+        "data/num_train_examples": train_dataset.num_samples,
         "data/train_batches_per_epoch": len(train_dataset),
         "data/train_total_steps": len(train_dataset) * config.epochs,
         "data/num_eval_tasks": eval_dataset.num_tasks,
-        "data/num_eval_examples": len(eval_dataset.samples),
+        "data/num_eval_examples": eval_dataset.num_samples,
         "data/eval_batches_per_epoch": len(eval_dataset),
     }
     wandb.log(dataset_metrics)
