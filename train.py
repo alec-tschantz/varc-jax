@@ -2,7 +2,7 @@ import time
 from pathlib import Path
 from functools import partial
 from dataclasses import asdict, dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Callable
 
 import equinox as eqx
 import jax
@@ -257,7 +257,6 @@ def main(config: Config) -> None:
     model_key, train_key, eval_key = jax.random.split(key, 3)
 
     train_dataset, eval_dataset = create_datasets(config)
-    forward_dtype = getattr(jnp, config.dtype)
 
     model = ARCViT(
         num_tasks=train_dataset.num_tasks,
@@ -270,11 +269,9 @@ def main(config: Config) -> None:
         dropout=config.dropout,
         num_task_tokens=config.num_task_tokens,
         patch_size=config.patch_size,
-        dtype=forward_dtype,
+        dtype=getattr(jnp, config.dtype),
         key=model_key,
     )
-
-    params, static = eqx.partition(model, eqx.is_array)
 
     steps_per_epoch = len(train_dataset)
     total_steps = config.epochs * steps_per_epoch
@@ -289,6 +286,7 @@ def main(config: Config) -> None:
         end_value=0.0,
     )
 
+    params, static = eqx.partition(model, eqx.is_array)
     optimizer = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adamw(learning_rate=lr_schedule, weight_decay=config.weight_decay),
@@ -335,8 +333,6 @@ def main(config: Config) -> None:
             params, static, opt_state, metrics = p_train_step(
                 params, static, opt_state, shard, device_keys
             )
-
-            current_lr = lr_schedule(global_step)
             global_step += 1
 
             if step % config.log_every == 0:
@@ -346,7 +342,7 @@ def main(config: Config) -> None:
                         "train/loss": host_metrics["loss"],
                         "train/pixel_acc": host_metrics["pixel_acc"],
                         "train/exact_acc": host_metrics["exact_acc"],
-                        "train/lr": float(current_lr),
+                        "train/lr": float(lr_schedule(global_step)),
                         "epoch": epoch,
                         "global_step": global_step,
                     },
