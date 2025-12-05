@@ -18,8 +18,7 @@ from varc import ARCViT, ARCDataset, IGNORE_INDEX, collate_batch
 @dataclass
 class Config:
     data_path: str = "data/arc"
-    rearc_path: str = "data/rearc"
-    train_split: str = "training"
+    rearc_path: Optional[str] = "data/rearc"
     epochs: int = 100
     batch_size: int = 256
     learning_rate: float = 3e-4
@@ -41,25 +40,11 @@ class Config:
     num_colors: int = 12
 
 
-def _shard_batch(batch: Dict[str, jax.Array], num_devices: int) -> Dict[str, jax.Array]:
-    def _reshape(x):
-        local_batch_size = x.shape[0] // num_devices
-        return x.reshape(num_devices, local_batch_size, *x.shape[1:])
-
-    return jax.tree_util.tree_map(_reshape, batch)
-
-
-def _to_jax(batch: Dict[str, torch.Tensor]) -> Dict[str, jax.Array]:
-    return {
-        "inputs": jnp.asarray(batch["inputs"].numpy(), dtype=jnp.int32),
-        "task_ids": jnp.asarray(batch["task_ids"].numpy(), dtype=jnp.int32),
-        "attention_mask": jnp.asarray(batch["attention_mask"].numpy(), dtype=jnp.bool_),
-        "targets": jnp.asarray(batch["targets"].numpy(), dtype=jnp.int32),
-    }
-
-
 def loss_fn(
-    model: ARCViT, batch: Dict[str, jax.Array], key: jax.Array
+    model: ARCViT,
+    batch: Dict[str, jax.Array],
+    key: jax.Array,
+    inference: bool,
 ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
     sample_keys = jax.random.split(key, batch["inputs"].shape[0])
 
@@ -69,7 +54,7 @@ def loss_fn(
             task_id,
             attention_mask=mask,
             key=subkey,
-            inference=False,
+            inference=inference,
         )
 
     logits = jax.vmap(forward_one)(
@@ -100,7 +85,8 @@ def loss_fn(
     exact_fn = lambda p, l: jnp.all((p == l) | (l == IGNORE_INDEX))
     exact_acc = jax.vmap(exact_fn)(preds, batch["targets"]).mean()
 
-    return loss, {"loss": loss, "pixel_acc": pixel_acc, "exact_acc": exact_acc}
+    metrics = {"loss": loss, "pixel_acc": pixel_acc, "exact_acc": exact_acc}
+    return loss, metrics
 
 
 def make_train_step(optimizer: optax.GradientTransformation):
@@ -112,8 +98,8 @@ def make_train_step(optimizer: optax.GradientTransformation):
         key: jax.Array,
     ) -> Tuple[ARCViT, ARCViT, optax.OptState, Dict[str, jax.Array]]:
         def compute_loss(p):
-            mdl = eqx.combine(p, static)
-            return loss_fn(mdl, batch, key)
+            model = eqx.combine(p, static)
+            return loss_fn(model, batch, key, inference=False)
 
         (loss, metrics), grads = eqx.filter_value_and_grad(compute_loss, has_aux=True)(
             params
@@ -121,7 +107,7 @@ def make_train_step(optimizer: optax.GradientTransformation):
 
         grads = jax.lax.pmean(grads, axis_name="devices")
         loss = jax.lax.pmean(loss, axis_name="devices")
-        metrics = jax.tree.map(lambda x: jax.lax.pmean(x, "devices"), metrics)
+        metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "devices"), metrics)
 
         updates, opt_state = optimizer.update(grads, opt_state, params=params)
         params = eqx.apply_updates(params, updates)
@@ -132,17 +118,51 @@ def make_train_step(optimizer: optax.GradientTransformation):
     return train_step
 
 
-def main(config: Config) -> None:
-    devices = jax.local_devices()
-    num_devices = len(devices)
+def eval_step(
+    params: ARCViT,
+    static: ARCViT,
+    batch: Dict[str, jax.Array],
+    key: jax.Array,
+) -> Dict[str, jax.Array]:
+    model = eqx.combine(params, static)
+    _, metrics = loss_fn(model, batch, key, inference=True)
+    return jax.tree.map(lambda x: jax.lax.pmean(x, "devices"), metrics)
 
-    key = jax.random.PRNGKey(config.seed)
-    model_key, train_key = jax.random.split(key)
 
+def evaluate_model(
+    params: ARCViT,
+    static: ARCViT,
+    eval_loader: DataLoader,
+    p_eval_step,
+    eval_key: jax.Array,
+    num_devices: int,
+) -> Dict[str, float]:
+    metrics_sum = None
+
+    for batch_torch in eval_loader:
+        batch = _to_jax(batch_torch)
+        shard = _shard_batch(batch, num_devices)
+
+        eval_key, step_key = jax.random.split(eval_key)
+        device_keys = jax.random.split(step_key, num_devices)
+
+        metrics = p_eval_step(params, static, shard, device_keys)
+        host_metrics = jax.tree_util.tree_map(lambda x: float(x[0]), metrics)
+
+        metrics_sum = (
+            jax.tree_util.tree_map(lambda a, b: a + b, metrics_sum, host_metrics)
+            if metrics_sum is not None
+            else host_metrics
+        )
+
+    return jax.tree_util.tree_map(lambda x: x / len(eval_loader), metrics_sum)
+
+
+def create_dataloaders(config: Config):
     train_dataset = ARCDataset(
         path=Path(config.data_path),
-        extra_train_paths=[Path(config.rearc_path)],
-        split=config.train_split,
+        extra_train_path=Path(config.rearc_path) if config.rearc_path else None,
+        split="training",
         subset="train",
         max_size=config.image_size,
         task_lookup=None,
@@ -159,6 +179,54 @@ def main(config: Config) -> None:
         drop_last=True,
         collate_fn=collate_batch,
     )
+
+    eval_dataset = ARCDataset(
+        path=Path(config.data_path),
+        split="training",
+        subset="test",
+        max_size=config.image_size,
+        task_lookup=train_dataset.task_lookup,
+        translation_enabled=False,
+        resolution_enabled=False,
+        fix_scale_factor=2,
+    )
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=0,
+        drop_last=True,
+        collate_fn=collate_batch,
+    )
+
+    return train_dataset, train_loader, eval_dataset, eval_loader
+
+
+def _shard_batch(batch: Dict[str, jax.Array], num_devices: int) -> Dict[str, jax.Array]:
+    def _reshape(x):
+        local_batch_size = x.shape[0] // num_devices
+        return x.reshape(num_devices, local_batch_size, *x.shape[1:])
+
+    return jax.tree_util.tree_map(_reshape, batch)
+
+
+def _to_jax(batch: Dict[str, torch.Tensor]) -> Dict[str, jax.Array]:
+    return {
+        "inputs": jnp.asarray(batch["inputs"].numpy(), dtype=jnp.int32),
+        "task_ids": jnp.asarray(batch["task_ids"].numpy(), dtype=jnp.int32),
+        "attention_mask": jnp.asarray(batch["attention_mask"].numpy(), dtype=jnp.bool_),
+        "targets": jnp.asarray(batch["targets"].numpy(), dtype=jnp.int32),
+    }
+
+
+def main(config: Config) -> None:
+    devices = jax.local_devices()
+    num_devices = len(devices)
+
+    key = jax.random.PRNGKey(config.seed)
+    model_key, train_key, eval_key = jax.random.split(key, 3)
+
+    train_dataset, train_loader, eval_dataset, eval_loader = create_dataloaders(config)
 
     model = ARCViT(
         num_tasks=train_dataset.num_tasks,
@@ -201,20 +269,24 @@ def main(config: Config) -> None:
 
     train_step = make_train_step(optimizer)
     p_train_step = jax.pmap(train_step, axis_name="devices")
+    p_eval_step = jax.pmap(eval_step, axis_name="devices")
 
     wandb.init(
         project=config.wandb_project,
         name=config.wandb_run_name,
         config=asdict(config),
     )
-    wandb.log(
-        {
-            "num_tasks": train_dataset.num_tasks,
-            "num_examples": len(train_dataset),
-            "batches_per_epoch": len(train_loader),
-            "total_steps": len(train_loader) * config.epochs,
-        }
-    )
+
+    dataset_metrics = {
+        "data/num_train_tasks": train_dataset.num_tasks,
+        "data/num_train_examples": len(train_dataset),
+        "data/train_batches_per_epoch": len(train_loader),
+        "data/train_total_steps": len(train_loader) * config.epochs,
+        "data/num_eval_tasks": eval_dataset.num_tasks,
+        "data/num_eval_examples": len(eval_dataset),
+        "data/eval_batches_per_epoch": len(eval_loader),
+    }
+    wandb.log(dataset_metrics)
 
     global_step = 0
     for epoch in range(1, config.epochs + 1):
@@ -249,13 +321,26 @@ def main(config: Config) -> None:
                 )
 
         epoch_time = time.time() - epoch_start
-        wandb.log(
-            {
-                "epoch": epoch,
-                "epoch_time": epoch_time,
-            },
-            step=global_step,
+
+        eval_key, epoch_key = jax.random.split(eval_key)
+        eval_metrics = evaluate_model(
+            params,
+            static,
+            eval_loader,
+            p_eval_step,
+            epoch_key,
+            num_devices,
         )
+
+        log_metrics = {
+            "epoch": epoch,
+            "epoch_time": epoch_time,
+            "global_step": global_step,
+        }
+        for k, v in eval_metrics.items():
+            log_metrics[f"eval/{k}"] = v
+
+        wandb.log(log_metrics, step=global_step)
 
     wandb.finish()
 

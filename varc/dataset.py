@@ -24,7 +24,7 @@ class ARCDataset(Dataset):
         translation_enabled: bool = True,
         resolution_enabled: bool = True,
         fix_scale_factor: int = 2,
-        extra_train_paths: Optional[Iterable[Path]] = None,
+        extra_train_path: Optional[Path] = None,
         seed: int = 0
     ) -> None:
         self.rng = random.Random(seed)
@@ -43,9 +43,8 @@ class ARCDataset(Dataset):
 
         self._load_data(self.path / split)
 
-        if self.subset == "train" and extra_train_paths:
-            for extra_path in extra_train_paths:
-                self._load_data(Path(extra_path))
+        if self.subset == "train" and extra_train_path:
+            self._load_data(Path(extra_train_path))
 
         self.num_tasks = len(self.task_lookup)
 
