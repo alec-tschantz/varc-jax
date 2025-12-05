@@ -115,15 +115,14 @@ class ARCViT(eqx.Module):
         inference: bool = False,
     ) -> Float[Array, "B C H W"]:
         """
-        Shapes:
-            B: batch size
-            H, W: image height/width
-            E: embedding dim
-            T: number of task tokens
-            S: number of input tokens (grid size x grid size)
-            C: number of output colors
-            P: patch_size
-            G: grid_size = height // patch_size
+        B: batch size
+        H, W: image height/width
+        E: embedding dim
+        T: number of task tokens
+        S: number of input tokens (grid size x grid size)
+        C: number of output colors
+        P: patch_size
+        G: grid_size = height // patch_size
         """
 
         drop_key, enc_key = (None, None) if key is None else jax.random.split(key)

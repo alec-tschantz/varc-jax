@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 from functools import partial
@@ -351,6 +352,12 @@ def main(config: Config) -> None:
             epoch_key,
             num_devices,
         )
+
+        os.makedirs("checkpoints", exist_ok=True)
+        params_host = jax.tree.map(lambda x: x[0], params)
+        ckpt_path = os.path.join("checkpoints", f"{config.wandb_project}.eqx")
+        eqx.tree_serialise_leaves(ckpt_path, eqx.combine(params_host, static))
+
 
         wandb.log(
             {
