@@ -1,12 +1,11 @@
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterable
 
-import argparse
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 IGNORE_INDEX = 10
 PAD_INDEX = 11
@@ -16,7 +15,7 @@ MAX_SIZE = 30
 class ARCDataset(Dataset):
     def __init__(
         self,
-        root: Path,
+        path: Path,
         split: str,
         subset: str = "train",
         max_size: int = 32,
@@ -25,9 +24,11 @@ class ARCDataset(Dataset):
         translation_enabled: bool = True,
         resolution_enabled: bool = True,
         fix_scale_factor: int = 2,
+        extra_train_paths: Optional[Iterable[Path]] = None,
+        seed: int = 0
     ) -> None:
-        self.rng = random.Random(42)
-        self.root = Path(root)
+        self.rng = random.Random(seed)
+        self.path = Path(path)
         self.max_size = max_size
         self.subset = subset
 
@@ -40,16 +41,25 @@ class ARCDataset(Dataset):
             dict(task_lookup) if task_lookup is not None else {}
         )
 
-        split_dir = self.root / split
-        files = sorted(split_dir.glob("*.json"))
-        examples_key = "train" if subset == "train" else "test"
+        self._load_data(self.path / split)
+
+        if self.subset == "train" and extra_train_paths:
+            for extra_path in extra_train_paths:
+                self._load_data(Path(extra_path))
+
+        self.num_tasks = len(self.task_lookup)
+
+    def _load_data(self, directory: Path) -> None:
+        files = sorted(directory.glob("*.json"))
+        examples_key = "train" if self.subset == "train" else "test"
 
         for file_path in files:
             task_name = file_path.stem
-            if task_lookup is None:
-                task_index = self.task_lookup.setdefault(
-                    task_name, len(self.task_lookup)
-                )
+
+            if self.subset == "train":
+                if task_name not in self.task_lookup:
+                    self.task_lookup[task_name] = len(self.task_lookup)
+                task_index = self.task_lookup[task_name]
             else:
                 if task_name not in self.task_lookup:
                     continue
@@ -78,8 +88,6 @@ class ARCDataset(Dataset):
                     }
                 )
 
-        self.num_tasks = len(self.task_lookup)
-
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -93,13 +101,6 @@ class ARCDataset(Dataset):
             rng=self.rng,
             if_translation=self.translation_enabled,
         )
-
-    def _get_or_add_task_index(self, task_name: str) -> int:
-        if task_name in self.task_lookup:
-            return self.task_lookup[task_name]
-        task_index = len(self.task_lookup)
-        self.task_lookup[task_name] = task_index
-        return task_index
 
     def process_per_example(
         self, example, task_index, task_name, example_index, rng, if_translation=True

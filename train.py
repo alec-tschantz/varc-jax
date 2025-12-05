@@ -17,7 +17,8 @@ from varc import ARCViT, ARCDataset, IGNORE_INDEX, collate_batch
 
 @dataclass
 class Config:
-    data_root: str = "data/arc"
+    data_path: str = "data/arc"
+    rearc_path: str = "data/rearc"
     train_split: str = "training"
     epochs: int = 100
     batch_size: int = 256
@@ -139,7 +140,8 @@ def main(config: Config) -> None:
     model_key, train_key = jax.random.split(key)
 
     train_dataset = ARCDataset(
-        root=Path(config.data_root),
+        path=Path(config.data_path),
+        extra_train_paths=[Path(config.rearc_path)],
         split=config.train_split,
         subset="train",
         max_size=config.image_size,
