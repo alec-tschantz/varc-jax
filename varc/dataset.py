@@ -1,5 +1,4 @@
 import json
-from functools import partial
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -126,15 +125,7 @@ class Dataset:
             }
 
 
-def _pad_to_max(grid: List[List[int]], max_h: int, max_w: int) -> np.ndarray:
-    arr = np.array(grid, dtype=np.int32)
-    h, w = arr.shape
-    padded = np.full((max_h, max_w), IGNORE_INDEX, dtype=np.int32)
-    padded[:h, :w] = arr
-    return padded
-
-
-def _augment_single_example(
+def augment_example(
     key: jax.Array,
     raw_input: jax.Array,
     raw_target: jax.Array,
@@ -245,45 +236,9 @@ def _augment_single_example(
     }
 
 
-def make_augment_batch(
-    *,
-    max_size: int = 64,
-    resolution_enabled: bool = True,
-    translation_enabled: bool = True,
-    fix_scale_factor: int = 2,
-) -> Callable[[jax.Array, Dict[str, jax.Array]], Dict[str, jax.Array]]:
-    augment_fn = partial(
-        _augment_single_example,
-        max_size=max_size,
-        resolution_enabled=resolution_enabled,
-        translation_enabled=translation_enabled,
-        fix_scale_factor=fix_scale_factor,
-    )
-
-    vmap_augment = jax.vmap(augment_fn, in_axes=(0, 0, 0, 0, 0))
-
-    def augment_batch(
-        key: jax.Array,
-        batch: Dict[str, jax.Array],
-    ) -> Dict[str, jax.Array]:
-        bsz = batch["inputs"].shape[0]
-        keys = jax.random.split(key, bsz)
-
-        aug_out = vmap_augment(
-            keys,
-            batch["inputs"],
-            batch["targets"],
-            batch["input_shapes"],
-            batch["target_shapes"],
-        )
-
-        return {
-            "inputs": aug_out["inputs"],
-            "attention_mask": aug_out["attention_mask"],
-            "targets": aug_out["targets"],
-            "task_ids": batch["task_ids"],
-            "example_index": batch["example_index"],
-            "target_shape": aug_out["target_shape"],
-        }
-
-    return augment_batch
+def _pad_to_max(grid: List[List[int]], max_h: int, max_w: int) -> np.ndarray:
+    arr = np.array(grid, dtype=np.int32)
+    h, w = arr.shape
+    padded = np.full((max_h, max_w), IGNORE_INDEX, dtype=np.int32)
+    padded[:h, :w] = arr
+    return padded

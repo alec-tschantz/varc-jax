@@ -1,5 +1,6 @@
 import time
 from pathlib import Path
+from functools import partial
 from dataclasses import asdict, dataclass
 from typing import Dict, Optional, Tuple
 
@@ -10,7 +11,7 @@ import optax
 import tyro
 import wandb
 
-from varc import ARCViT, Dataset, IGNORE_INDEX, make_augment_batch
+from varc import ARCViT, Dataset, IGNORE_INDEX, augment_example
 
 
 @dataclass
@@ -99,16 +100,14 @@ def make_train_step(optimizer: optax.GradientTransformation, config: Config):
     ) -> Tuple[ARCViT, ARCViT, optax.OptState, Dict[str, jax.Array]]:
 
         aug_key, model_key = jax.random.split(key)
-
         batch = train_augment_batch(aug_key, raw_batch)
 
         def compute_loss(p):
             model = eqx.combine(p, static)
             return loss_fn(model, batch, model_key, inference=False)
 
-        (loss, metrics), grads = eqx.filter_value_and_grad(compute_loss, has_aux=True)(
-            params
-        )
+        grad_fn = eqx.filter_value_and_grad(compute_loss, has_aux=True)
+        (loss, metrics), grads = grad_fn(params)
 
         grads = jax.lax.pmean(grads, axis_name="devices")
         loss = jax.lax.pmean(loss, axis_name="devices")
@@ -138,7 +137,6 @@ def make_eval_step(config: Config):
         key: jax.Array,
     ) -> Dict[str, jax.Array]:
         aug_key, model_key = jax.random.split(key)
-
         batch = eval_augment_batch(aug_key, raw_batch)
 
         model = eqx.combine(params, static)
@@ -174,6 +172,50 @@ def evaluate_model(
         )
 
     return jax.tree_util.tree_map(lambda x: x / len(eval_dataset), metrics_sum)
+
+
+def make_augment_batch(
+    *,
+    max_size: int = 64,
+    resolution_enabled: bool = True,
+    translation_enabled: bool = True,
+    fix_scale_factor: int = 2,
+) -> Callable[[jax.Array, Dict[str, jax.Array]], Dict[str, jax.Array]]:
+    augment_fn = partial(
+        augment_example,
+        max_size=max_size,
+        resolution_enabled=resolution_enabled,
+        translation_enabled=translation_enabled,
+        fix_scale_factor=fix_scale_factor,
+    )
+
+    vmap_augment = jax.vmap(augment_fn, in_axes=(0, 0, 0, 0, 0))
+
+    def augment_batch(
+        key: jax.Array,
+        batch: Dict[str, jax.Array],
+    ) -> Dict[str, jax.Array]:
+        bsz = batch["inputs"].shape[0]
+        keys = jax.random.split(key, bsz)
+
+        aug_out = vmap_augment(
+            keys,
+            batch["inputs"],
+            batch["targets"],
+            batch["input_shapes"],
+            batch["target_shapes"],
+        )
+
+        return {
+            "inputs": aug_out["inputs"],
+            "attention_mask": aug_out["attention_mask"],
+            "targets": aug_out["targets"],
+            "task_ids": batch["task_ids"],
+            "example_index": batch["example_index"],
+            "target_shape": aug_out["target_shape"],
+        }
+
+    return augment_batch
 
 
 def create_datasets(config: Config):
