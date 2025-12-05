@@ -3,6 +3,7 @@ from typing import Optional
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float, Int
 
 from .nn import PatchEmbed, Transformer
 
@@ -11,7 +12,7 @@ class ARCViT(eqx.Module):
     color_embed: eqx.nn.Embedding
     task_token_embed: eqx.nn.Embedding
     patch_embed: PatchEmbed
-    positional_embed: jax.Array
+    positional_embed: Float[Array, "S E"]
     encoder: Transformer
     norm: eqx.nn.LayerNorm
     head: eqx.nn.Linear
@@ -57,26 +58,13 @@ class ARCViT(eqx.Module):
         ) = jax.random.split(key, 6)
 
         self.color_embed = eqx.nn.Embedding(num_colors, embed_dim, key=color_key)
-        w_color = (
-            jax.random.truncated_normal(
-                color_key, lower=-2.0, upper=2.0, shape=self.color_embed.weight.shape
-            )
-            * 0.02
-        )
+        w_color = self._trunc_normal(color_key, self.color_embed.weight.shape)
         self.color_embed = eqx.tree_at(lambda m: m.weight, self.color_embed, w_color)
 
         self.task_token_embed = eqx.nn.Embedding(
             num_tasks, embed_dim * num_task_tokens, key=task_key
         )
-        w_task = (
-            jax.random.truncated_normal(
-                task_key,
-                lower=-2.0,
-                upper=2.0,
-                shape=self.task_token_embed.weight.shape,
-            )
-            * 0.02
-        )
+        w_task = self._trunc_normal(task_key, self.task_token_embed.weight.shape)
         self.task_token_embed = eqx.tree_at(
             lambda m: m.weight, self.task_token_embed, w_task
         )
@@ -88,11 +76,8 @@ class ARCViT(eqx.Module):
             key=patch_key,
         )
 
-        self.positional_embed = (
-            jax.random.truncated_normal(
-                pos_key, lower=-2.0, upper=2.0, shape=(self.seq_length, embed_dim)
-            )
-            * 0.02
+        self.positional_embed = self._trunc_normal(
+            pos_key, (self.seq_length, embed_dim)
         )
 
         self.encoder = Transformer(
@@ -102,7 +87,7 @@ class ARCViT(eqx.Module):
             mlp_dim=mlp_dim,
             dropout=dropout,
             token_grid=self.token_grid,
-            task_rope_tokens=num_task_tokens,
+            rope_skip_dim=num_task_tokens,
             key=enc_key,
         )
 
@@ -114,31 +99,17 @@ class ARCViT(eqx.Module):
 
         self.dropout = eqx.nn.Dropout(dropout)
 
-    def _token_mask(self, attention_mask: jax.Array) -> jax.Array:
-        mask_grid = attention_mask.reshape(
-            self.token_grid,
-            self.patch_size,
-            self.token_grid,
-            self.patch_size,
-        )
-        mask_grid = mask_grid.max(axis=1).max(axis=2)
-        flat = mask_grid.reshape(-1)
-        is_valid = flat.astype(bool)
-
-        prefix = jnp.ones((self.num_task_tokens,), dtype=bool)
-        return jnp.concatenate([prefix, is_valid], axis=0)
-
     def __call__(
         self,
-        pixels: jax.Array,
-        task_id: jax.Array,
+        pixels: Int[Array, "H W"],
+        task_id: Int[Array, " 1"],
         *,
-        attention_mask: Optional[jax.Array] = None,
+        attention_mask: Optional[Int[Array, "H W"]] = None,
         key: Optional[jax.Array] = None,
         inference: bool = False,
-    ) -> jax.Array:
+    ) -> Float[Array, "C H W"]:
         drop_key, enc_key = (None, None) if key is None else jax.random.split(key)
-        dropout_inference = inference or key is None
+        inference = inference or key is None
 
         color_lookup = jax.vmap(jax.vmap(self.color_embed))
         embedded = color_lookup(pixels.astype(jnp.int32))
@@ -150,9 +121,7 @@ class ARCViT(eqx.Module):
         task_tokens = task_tokens.reshape(self.num_task_tokens, -1)
 
         hidden_states = jnp.concatenate([task_tokens, patch_tokens], axis=0)
-        hidden_states = self.dropout(
-            hidden_states, key=drop_key, inference=dropout_inference
-        )
+        hidden_states = self.dropout(hidden_states, key=drop_key, inference=inference)
 
         attention_mask = (
             self._token_mask(attention_mask) if attention_mask is not None else None
@@ -180,3 +149,23 @@ class ARCViT(eqx.Module):
         logits = logits.reshape(self.image_size, self.image_size, self.num_colors)
         logits = jnp.transpose(logits, (2, 0, 1))
         return logits
+
+    def _token_mask(self, attention_mask: Int[Array, "H W"]) -> Int[Array, " S"]:
+        mask_grid = attention_mask.reshape(
+            self.token_grid,
+            self.patch_size,
+            self.token_grid,
+            self.patch_size,
+        )
+        mask_grid = mask_grid.max(axis=1).max(axis=2)
+        flat = mask_grid.reshape(-1)
+        is_valid = flat.astype(bool)
+
+        prefix = jnp.ones((self.num_task_tokens,), dtype=bool)
+        return jnp.concatenate([prefix, is_valid], axis=0)
+
+    @staticmethod
+    def _trunc_normal(key: jax.Array, shape: tuple) -> jax.Array:
+        return (
+            jax.random.truncated_normal(key, lower=-2.0, upper=2.0, shape=shape) * 0.02
+        )

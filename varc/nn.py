@@ -4,61 +4,71 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+
 
 def _rotate_half(x: jax.Array) -> jax.Array:
-    x = x.reshape(*x.shape[:-1], -1, 2)
+    original_shape = x.shape
+    x = x.reshape(original_shape[:-1] + (-1, 2))
     x1, x2 = x[..., 0], x[..., 1]
-    res = jnp.stack([-x2, x1], axis=-1)
-    return res.reshape(*res.shape[:-2], -1)
+    return jnp.stack([-x2, x1], axis=-1).reshape(original_shape)
 
 
 class RotaryEmbedding(eqx.Module):
     freqs_cos: jax.Array
     freqs_sin: jax.Array
-    task_rope_tokens: int = eqx.field(static=True)
+    rope_skip_dim: int = eqx.field(static=True)
 
-    def __init__(self, dim: int, pt_seq_len: int, task_rope_tokens: int = 0):
-        freqs = 1.0 / (
-            10000.0 ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / float(dim))
-        )
+    def __init__(self, head_dim: int, pt_seq_len: int, rope_skip_dim: int = 0):
+        self.rope_skip_dim = rope_skip_dim
+
+        dim = head_dim // 2
+        inv_freq = 1.0 / (10000.0 ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
+
         t = jnp.arange(pt_seq_len, dtype=jnp.float32)
 
-        freqs_1d = jnp.einsum("i,f->if", t, freqs)
+        freqs_1d = jnp.einsum("i,f->if", t, inv_freq)
         freqs_1d = jnp.repeat(freqs_1d, 2, axis=-1)
+        freq_dim = freqs_1d.shape[-1]
+
         freqs_h = freqs_1d[:, None, :]
         freqs_w = freqs_1d[None, :, :]
+        freqs_h = jnp.broadcast_to(freqs_h, (pt_seq_len, pt_seq_len, freq_dim))
+        freqs_w = jnp.broadcast_to(freqs_w, (pt_seq_len, pt_seq_len, freq_dim))
 
-        freqs_2d = jnp.concatenate(
-            [
-                jnp.broadcast_to(freqs_h, (pt_seq_len, pt_seq_len, freqs_1d.shape[-1])),
-                jnp.broadcast_to(freqs_w, (pt_seq_len, pt_seq_len, freqs_1d.shape[-1])),
-            ],
-            axis=-1,
-        )
+        freqs_2d = jnp.concatenate([freqs_h, freqs_w], axis=-1)
         freqs_flat = freqs_2d.reshape(pt_seq_len * pt_seq_len, -1)
 
         self.freqs_cos = jnp.cos(freqs_flat)
         self.freqs_sin = jnp.sin(freqs_flat)
-        self.task_rope_tokens = task_rope_tokens
 
     def __call__(self, t: jax.Array) -> jax.Array:
-        total_seq = t.shape[1]
-        usable = total_seq - self.task_rope_tokens
-        if usable <= 0:
-            return t
+        prefix = t[:, : self.rope_skip_dim, :]
+        x = t[:, self.rope_skip_dim :, :]
 
-        head_dim = t.shape[2]
-        cos = jax.lax.stop_gradient(self.freqs_cos[:usable, :head_dim])
-        sin = jax.lax.stop_gradient(self.freqs_sin[:usable, :head_dim])
+        seq_len = x.shape[1]
+        cos = jax.lax.stop_gradient(self.freqs_cos[:seq_len, :])
+        sin = jax.lax.stop_gradient(self.freqs_sin[:seq_len, :])
 
-        to_rotate = t[:, self.task_rope_tokens :, :head_dim]
-        rotated = to_rotate * cos + _rotate_half(to_rotate) * sin
+        cos = cos[None, :, :]
+        sin = sin[None, :, :]
+        x_rot = x * cos + _rotate_half(x) * sin
 
-        if self.task_rope_tokens == 0:
-            return rotated
+        if self.rope_skip_dim == 0:
+            return x_rot
 
-        prefix = t[:, : self.task_rope_tokens, :head_dim]
-        return jnp.concatenate([prefix, rotated], axis=1)
+        return jnp.concatenate([prefix, x_rot], axis=1)
 
 
 class PatchEmbed(eqx.Module):
@@ -113,7 +123,7 @@ class Attention(eqx.Module):
         num_heads: int,
         dropout: float,
         token_grid: int,
-        task_rope_tokens: int,
+        rope_skip_dim: int,
         *,
         key: jax.Array,
     ):
@@ -129,9 +139,9 @@ class Attention(eqx.Module):
         self.proj_dropout = eqx.nn.Dropout(dropout)
 
         self.rotary = RotaryEmbedding(
-            dim=self.head_dim // 2,
+            head_dim=self.head_dim,
             pt_seq_len=token_grid,
-            task_rope_tokens=task_rope_tokens,
+            rope_skip_dim=rope_skip_dim,
         )
 
     def __call__(
@@ -194,7 +204,7 @@ class Block(eqx.Module):
         mlp_dim: int,
         dropout: float,
         token_grid: int,
-        task_rope_tokens: int,
+        rope_skip_dim: int,
         *,
         key: jax.Array,
     ):
@@ -205,7 +215,7 @@ class Block(eqx.Module):
             num_heads=num_heads,
             dropout=dropout,
             token_grid=token_grid,
-            task_rope_tokens=task_rope_tokens,
+            rope_skip_dim=rope_skip_dim,
             key=attn_key,
         )
 
@@ -264,7 +274,7 @@ class Transformer(eqx.Module):
         mlp_dim: int,
         dropout: float,
         token_grid: int,
-        task_rope_tokens: int,
+        rope_skip_dim: int,
         *,
         key: jax.Array,
     ):
@@ -276,7 +286,7 @@ class Transformer(eqx.Module):
                 mlp_dim=mlp_dim,
                 dropout=dropout,
                 token_grid=token_grid,
-                task_rope_tokens=task_rope_tokens,
+                rope_skip_dim=rope_skip_dim,
                 key=layer_key,
             )
             for layer_key in keys

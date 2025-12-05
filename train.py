@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 from dataclasses import asdict, dataclass
 from typing import Dict, Optional, Tuple
 
@@ -8,15 +9,16 @@ import jax.numpy as jnp
 import optax
 import tyro
 import wandb
+import torch
+from torch.utils.data import DataLoader
 
-from varc import ARCViT
-from varc.dataset import Dataset, DatasetConfig, IGNORE_LABEL_ID
+from varc import ARCViT, ARCDataset, IGNORE_INDEX, collate_batch
 
 
 @dataclass
 class Config:
-    data_root: str = "data/arc1concept-aug-1000"
-    train_split: str = "train"
+    data_root: str = "data/arc"
+    train_split: str = "training"
     epochs: int = 100
     batch_size: int = 256
     learning_rate: float = 3e-4
@@ -34,6 +36,9 @@ class Config:
     wandb_run_name: Optional[str] = None
     max_grad_norm: float = 1.0
 
+    image_size: int = 64
+    num_colors: int = 12
+
 
 def _shard_batch(batch: Dict[str, jax.Array], num_devices: int) -> Dict[str, jax.Array]:
     def _reshape(x):
@@ -41,6 +46,15 @@ def _shard_batch(batch: Dict[str, jax.Array], num_devices: int) -> Dict[str, jax
         return x.reshape(num_devices, local_batch_size, *x.shape[1:])
 
     return jax.tree_util.tree_map(_reshape, batch)
+
+
+def _to_jax(batch: Dict[str, torch.Tensor]) -> Dict[str, jax.Array]:
+    return {
+        "inputs": jnp.asarray(batch["inputs"].numpy(), dtype=jnp.int32),
+        "task_ids": jnp.asarray(batch["task_ids"].numpy(), dtype=jnp.int32),
+        "attention_mask": jnp.asarray(batch["attention_mask"].numpy(), dtype=jnp.bool_),
+        "targets": jnp.asarray(batch["targets"].numpy(), dtype=jnp.int32),
+    }
 
 
 def loss_fn(
@@ -63,9 +77,9 @@ def loss_fn(
 
     logits_hw = jnp.transpose(logits, (0, 2, 3, 1))
     logits_flat = logits_hw.reshape(-1, logits.shape[1])
-    labels_flat = batch["labels"].reshape(-1)
+    labels_flat = batch["targets"].reshape(-1)
 
-    valid_mask = labels_flat != IGNORE_LABEL_ID
+    valid_mask = labels_flat != IGNORE_INDEX
     labels_masked = jnp.where(valid_mask, labels_flat, 0)
     mask_float = valid_mask.astype(jnp.float32)
 
@@ -82,10 +96,8 @@ def loss_fn(
     correct = (pred_flat == labels_flat).astype(jnp.float32) * mask_float
     pixel_acc = correct.sum() / denom
 
-    exact = jax.vmap(lambda p, l: jnp.all((p == l) | (l == IGNORE_LABEL_ID)))(
-        preds, batch["labels"]
-    )
-    exact_acc = exact.mean()
+    exact_fn = lambda p, l: jnp.all((p == l) | (l == IGNORE_INDEX))
+    exact_acc = jax.vmap(exact_fn)(preds, batch["targets"]).mean()
 
     return loss, {"loss": loss, "pixel_acc": pixel_acc, "exact_acc": exact_acc}
 
@@ -108,7 +120,7 @@ def make_train_step(optimizer: optax.GradientTransformation):
 
         grads = jax.lax.pmean(grads, axis_name="devices")
         loss = jax.lax.pmean(loss, axis_name="devices")
-        metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "devices"), metrics)
+        metrics = jax.tree.map(lambda x: jax.lax.pmean(x, "devices"), metrics)
 
         updates, opt_state = optimizer.update(grads, opt_state, params=params)
         params = eqx.apply_updates(params, updates)
@@ -126,18 +138,30 @@ def main(config: Config) -> None:
     key = jax.random.PRNGKey(config.seed)
     model_key, train_key = jax.random.split(key)
 
-    dataset_config = DatasetConfig(
-        seed=config.seed,
-        dataset_path=config.data_root,
-        global_batch_size=config.batch_size,
+    train_dataset = ARCDataset(
+        root=Path(config.data_root),
+        split=config.train_split,
+        subset="train",
+        max_size=config.image_size,
+        task_lookup=None,
+        translation_enabled=True,
+        resolution_enabled=True,
+        fix_scale_factor=2,
     )
-    train_dataset = Dataset(dataset_config, split=config.train_split)
-    image_size = train_dataset.image_size
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=0,
+        drop_last=True,
+        collate_fn=collate_batch,
+    )
 
     model = ARCViT(
-        num_tasks=train_dataset.metadata.num_puzzle_identifiers,
-        image_size=image_size,
-        num_colors=train_dataset.metadata.vocab_size,
+        num_tasks=train_dataset.num_tasks,
+        image_size=config.image_size,
+        num_colors=config.num_colors,
         embed_dim=config.embed_dim,
         depth=config.depth,
         num_heads=config.num_heads,
@@ -150,8 +174,7 @@ def main(config: Config) -> None:
 
     params, static = eqx.partition(model, eqx.is_array)
 
-    total_items = len(train_dataset)
-    steps_per_epoch = total_items // config.batch_size
+    steps_per_epoch = len(train_loader)
     total_steps = config.epochs * steps_per_epoch
     warmup_epochs = min(config.epochs // 5, 10)
     warmup_steps = warmup_epochs * steps_per_epoch
@@ -177,19 +200,26 @@ def main(config: Config) -> None:
     train_step = make_train_step(optimizer)
     p_train_step = jax.pmap(train_step, axis_name="devices")
 
-    if config.wandb_project:
-        wandb.init(
-            project=config.wandb_project,
-            name=config.wandb_run_name,
-            config=asdict(config),
-        )
+    wandb.init(
+        project=config.wandb_project,
+        name=config.wandb_run_name,
+        config=asdict(config),
+    )
+    wandb.log(
+        {
+            "num_tasks": train_dataset.num_tasks,
+            "num_examples": len(train_dataset),
+            "batches_per_epoch": len(train_loader),
+            "total_steps": len(train_loader) * config.epochs,
+        }
+    )
 
     global_step = 0
-
     for epoch in range(1, config.epochs + 1):
         epoch_start = time.time()
 
-        for step, batch in enumerate(train_dataset):
+        for step, batch_torch in enumerate(train_loader):
+            batch = _to_jax(batch_torch)
             shard = _shard_batch(batch, num_devices=num_devices)
 
             train_key, step_key = jax.random.split(train_key)
@@ -209,7 +239,7 @@ def main(config: Config) -> None:
                         "train/loss": host_metrics["loss"],
                         "train/pixel_acc": host_metrics["pixel_acc"],
                         "train/exact_acc": host_metrics["exact_acc"],
-                        "train/lr": current_lr,
+                        "train/lr": float(current_lr),
                         "epoch": epoch,
                         "global_step": global_step,
                     },
