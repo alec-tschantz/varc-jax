@@ -1,2 +1,2 @@
 from .model import ARCViT
-from .dataset import ARCDataset, IGNORE_INDEX, collate_batch
+from .dataset import Dataset, IGNORE_INDEX

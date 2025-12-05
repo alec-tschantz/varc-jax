@@ -1,0 +1,7 @@
+jax
+equinox
+optax
+tyro
+wandb
+numpy
+jaxtyping

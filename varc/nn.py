@@ -3,26 +3,7 @@ from typing import Optional
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-
-
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-
-
-def _rotate_half(x: jax.Array) -> jax.Array:
-    original_shape = x.shape
-    x = x.reshape(original_shape[:-1] + (-1, 2))
-    x1, x2 = x[..., 0], x[..., 1]
-    return jnp.stack([-x2, x1], axis=-1).reshape(original_shape)
+from jaxtyping import Array, Bool, Float
 
 
 class RotaryEmbedding(eqx.Module):
@@ -42,10 +23,12 @@ class RotaryEmbedding(eqx.Module):
         freqs_1d = jnp.repeat(freqs_1d, 2, axis=-1)
         freq_dim = freqs_1d.shape[-1]
 
-        freqs_h = freqs_1d[:, None, :]
-        freqs_w = freqs_1d[None, :, :]
-        freqs_h = jnp.broadcast_to(freqs_h, (pt_seq_len, pt_seq_len, freq_dim))
-        freqs_w = jnp.broadcast_to(freqs_w, (pt_seq_len, pt_seq_len, freq_dim))
+        freqs_h = jnp.broadcast_to(
+            freqs_1d[:, None, :], (pt_seq_len, pt_seq_len, freq_dim)
+        )
+        freqs_w = jnp.broadcast_to(
+            freqs_1d[None, :, :], (pt_seq_len, pt_seq_len, freq_dim)
+        )
 
         freqs_2d = jnp.concatenate([freqs_h, freqs_w], axis=-1)
         freqs_flat = freqs_2d.reshape(pt_seq_len * pt_seq_len, -1)
@@ -53,22 +36,24 @@ class RotaryEmbedding(eqx.Module):
         self.freqs_cos = jnp.cos(freqs_flat)
         self.freqs_sin = jnp.sin(freqs_flat)
 
-    def __call__(self, t: jax.Array) -> jax.Array:
-        prefix = t[:, : self.rope_skip_dim, :]
-        x = t[:, self.rope_skip_dim :, :]
+    def __call__(self, x: Float[Array, "B S H D"]) -> Float[Array, "B S H D"]:
+        orig_dtype = x.dtype
+        prefix = x[:, : self.rope_skip_dim, :, :]
+        main = x[:, self.rope_skip_dim :, :, :]
 
-        seq_len = x.shape[1]
+        seq_len = main.shape[1]
         cos = jax.lax.stop_gradient(self.freqs_cos[:seq_len, :])
         sin = jax.lax.stop_gradient(self.freqs_sin[:seq_len, :])
 
-        cos = cos[None, :, :]
-        sin = sin[None, :, :]
-        x_rot = x * cos + _rotate_half(x) * sin
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+        rotated = main * cos + _rotate_half(main) * sin
+        rotated = rotated.astype(orig_dtype)
 
         if self.rope_skip_dim == 0:
-            return x_rot
+            return rotated
 
-        return jnp.concatenate([prefix, x_rot], axis=1)
+        return jnp.concatenate([prefix, rotated], axis=1)
 
 
 class PatchEmbed(eqx.Module):
@@ -100,6 +85,7 @@ class PatchEmbed(eqx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        x = x.astype(self.conv.weight.dtype)
         x = self.conv(x)
         x = jnp.transpose(x, (1, 2, 0))
         x = x.reshape(self.grid * self.grid, self.embed_dim)
@@ -115,7 +101,8 @@ class Attention(eqx.Module):
 
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
-    scale: float = eqx.field(static=True)
+    dropout_rate: float = eqx.field(static=True)
+    dtype: jnp.dtype = eqx.field(static=True)
 
     def __init__(
         self,
@@ -124,12 +111,14 @@ class Attention(eqx.Module):
         dropout: float,
         token_grid: int,
         rope_skip_dim: int,
+        dtype: jnp.dtype,
         *,
         key: jax.Array,
     ):
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim**-0.5
+        self.dropout_rate = dropout
+        self.dtype = dtype
 
         qkv_key, proj_key = jax.random.split(key)
         self.qkv = eqx.nn.Linear(embed_dim, 3 * embed_dim, key=qkv_key)
@@ -146,56 +135,85 @@ class Attention(eqx.Module):
 
     def __call__(
         self,
-        x: jax.Array,
+        x: Float[Array, "B S E"],
         *,
-        attention_mask: Optional[jax.Array],
+        attention_mask: Optional[Bool[Array, "B S"]],
         key: Optional[jax.Array],
         inference: bool,
-    ) -> jax.Array:
-        seq_len = x.shape[0]
+    ) -> Float[Array, "B S E"]:
+        batch, seq_len, _ = x.shape
         attn_key, proj_key = (None, None) if key is None else jax.random.split(key)
-        dropout_inference = inference or key is None
+        inference = inference or key is None
 
-        qkv = jax.vmap(self.qkv)(x)
-        qkv = qkv.reshape(seq_len, 3, self.num_heads, self.head_dim)
+        qkv = jax.vmap(jax.vmap(self.qkv))(x)
+        qkv = qkv.reshape(batch, seq_len, 3, self.num_heads, self.head_dim)
 
-        qkv = jnp.transpose(qkv, (1, 2, 0, 3))
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q = qkv[:, :, 0, :, :].astype(self.dtype)
+        k = qkv[:, :, 1, :, :].astype(self.dtype)
+        v = qkv[:, :, 2, :, :].astype(self.dtype)
 
         q = self.rotary(q)
         k = self.rotary(k)
 
-        attn_scores = jnp.einsum("hld,hmd->hlm", q, k) * self.scale
-
         if attention_mask is not None:
-            attn_scores = jnp.where(
-                attention_mask[None, None, :],
-                attn_scores,
-                jnp.finfo(attn_scores.dtype).min,
-            )
+            valid = attention_mask[:, :, None, None].astype(self.dtype)
+            q = q * valid
+            k = k * valid
+            v = v * valid
 
-        attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-        attn_weights = self.attn_dropout(
-            attn_weights, key=attn_key, inference=dropout_inference
-        )
+        attn_out = _flash_attention(q, k, v, attention_mask=attention_mask)
 
-        context = jnp.einsum("hij,hjd->hid", attn_weights, v)
-        context = jnp.transpose(context, (1, 0, 2)).reshape(seq_len, -1)
-        context = jax.vmap(self.proj)(context)
-        context = self.proj_dropout(context, key=proj_key, inference=dropout_inference)
+        attn_out = self.attn_dropout(attn_out, key=attn_key, inference=inference)
+        attn_out = attn_out.reshape(batch, seq_len, -1)
+        attn_out = jax.vmap(jax.vmap(self.proj))(attn_out)
+        attn_out = self.proj_dropout(attn_out, key=proj_key, inference=inference)
+        attn_out = attn_out.astype(self.dtype)
+        return attn_out
 
-        return context
+
+class FeedForward(eqx.Module):
+    linear1: eqx.nn.Linear
+    linear2: eqx.nn.Linear
+    dropout_mid: eqx.nn.Dropout
+    dropout_out: eqx.nn.Dropout
+    dtype: jnp.dtype = eqx.field(static=True)
+
+    def __init__(
+        self,
+        embed_dim: int,
+        mlp_dim: int,
+        dropout: float,
+        dtype: jnp.dtype,
+        *,
+        key: jax.Array,
+    ):
+        k1, k2 = jax.random.split(key)
+        self.linear1 = eqx.nn.Linear(embed_dim, mlp_dim, key=k1)
+        self.linear2 = eqx.nn.Linear(mlp_dim, embed_dim, key=k2)
+        self.dropout_mid = eqx.nn.Dropout(dropout)
+        self.dropout_out = eqx.nn.Dropout(dropout)
+        self.dtype = dtype
+
+    def __call__(
+        self, x: Float[Array, "b s e"], *, key: Optional[jax.Array], inference: bool
+    ) -> Float[Array, "b s e"]:
+        k_mid, k_out = (None, None) if key is None else jax.random.split(key)
+        inference = inference or key is None
+
+        hidden = jax.vmap(jax.vmap(self.linear1))(x)
+        hidden = jax.nn.gelu(hidden)
+        hidden = self.dropout_mid(hidden, key=k_mid, inference=inference)
+        hidden = jax.vmap(jax.vmap(self.linear2))(hidden)
+        hidden = self.dropout_out(hidden, key=k_out, inference=inference)
+        return hidden.astype(self.dtype)
 
 
 class Block(eqx.Module):
     attn: Attention
     norm1: eqx.nn.LayerNorm
-    norm2: eqx.nn.LayerNorm
-    linear1: eqx.nn.Linear
-    linear2: eqx.nn.Linear
+    ff: FeedForward
     dropout1: eqx.nn.Dropout
-    dropout2: eqx.nn.Dropout
-    dropout3: eqx.nn.Dropout
+    norm2: eqx.nn.LayerNorm
 
     def __init__(
         self,
@@ -205,10 +223,11 @@ class Block(eqx.Module):
         dropout: float,
         token_grid: int,
         rope_skip_dim: int,
+        dtype: jnp.dtype,
         *,
         key: jax.Array,
     ):
-        attn_key, linear1_key, linear2_key = jax.random.split(key, 3)
+        attn_key, ff_key = jax.random.split(key, 2)
 
         self.attn = Attention(
             embed_dim=embed_dim,
@@ -216,49 +235,46 @@ class Block(eqx.Module):
             dropout=dropout,
             token_grid=token_grid,
             rope_skip_dim=rope_skip_dim,
+            dtype=dtype,
             key=attn_key,
         )
 
+        self.ff = FeedForward(
+            embed_dim=embed_dim,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            dtype=dtype,
+            key=ff_key,
+        )
+
         self.norm1 = eqx.nn.LayerNorm(embed_dim, use_weight=True, use_bias=True)
-        self.norm2 = eqx.nn.LayerNorm(embed_dim, use_weight=True, use_bias=True)
-
-        self.linear1 = eqx.nn.Linear(embed_dim, mlp_dim, key=linear1_key)
-        self.linear2 = eqx.nn.Linear(mlp_dim, embed_dim, key=linear2_key)
-
         self.dropout1 = eqx.nn.Dropout(dropout)
-        self.dropout2 = eqx.nn.Dropout(dropout)
-        self.dropout3 = eqx.nn.Dropout(dropout)
+        self.norm2 = eqx.nn.LayerNorm(embed_dim, use_weight=True, use_bias=True)
 
     def __call__(
         self,
-        x: jax.Array,
+        x: Float[Array, "B S E"],
         *,
-        attention_mask: Optional[jax.Array],
+        attention_mask: Optional[Bool[Array, "B S"]],
         key: Optional[jax.Array],
         inference: bool,
-    ) -> jax.Array:
-        keys = (None, None, None, None) if key is None else jax.random.split(key, 4)
-        dropout_inference = inference or key is None
+    ) -> Float[Array, "B S E"]:
+        keys = (None, None, None) if key is None else jax.random.split(key, 3)
+        inference = inference or key is None
 
         residual = x
         attn_out = self.attn(
             x, attention_mask=attention_mask, key=keys[0], inference=inference
         )
-        attn_out = self.dropout1(attn_out, key=keys[1], inference=dropout_inference)
+        attn_out = self.dropout1(attn_out, key=keys[1], inference=inference)
         x = residual + attn_out
 
-        norm1 = jax.vmap(self.norm1)
+        norm1 = jax.vmap(jax.vmap(self.norm1))
         x = norm1(x)
 
-        residual = x
-        mlp = jax.vmap(self.linear1)(x)
-        mlp = jax.nn.gelu(mlp)
-        mlp = self.dropout2(mlp, key=keys[2], inference=dropout_inference)
-        mlp = jax.vmap(self.linear2)(mlp)
-        mlp = self.dropout3(mlp, key=keys[3], inference=dropout_inference)
-        x = residual + mlp
+        x = x + self.ff(x, key=keys[2], inference=inference)
 
-        norm2 = jax.vmap(self.norm2)
+        norm2 = jax.vmap(jax.vmap(self.norm2))
         x = norm2(x)
         return x
 
@@ -275,6 +291,7 @@ class Transformer(eqx.Module):
         dropout: float,
         token_grid: int,
         rope_skip_dim: int,
+        dtype: jnp.dtype,
         *,
         key: jax.Array,
     ):
@@ -287,6 +304,7 @@ class Transformer(eqx.Module):
                 dropout=dropout,
                 token_grid=token_grid,
                 rope_skip_dim=rope_skip_dim,
+                dtype=dtype,
                 key=layer_key,
             )
             for layer_key in keys
@@ -294,12 +312,12 @@ class Transformer(eqx.Module):
 
     def __call__(
         self,
-        x: jax.Array,
+        x: Float[Array, "B S E"],
         *,
-        attention_mask: Optional[jax.Array],
+        attention_mask: Optional[Bool[Array, "B S"]],
         key: Optional[jax.Array],
         inference: bool,
-    ) -> jax.Array:
+    ) -> Float[Array, "B S E"]:
         layer_keys = (
             [None] * len(self.layers)
             if key is None
@@ -310,3 +328,56 @@ class Transformer(eqx.Module):
                 x, attention_mask=attention_mask, key=layer_key, inference=inference
             )
         return x
+
+
+def _flash_attention(
+    q: Float[Array, "B S H D"],
+    k: Float[Array, "B S H D"],
+    v: Float[Array, "B S H D"],
+    *,
+    attention_mask: Optional[Bool[Array, "B S"]],
+) -> Float[Array, "B S H D"]:
+    _, q_len, _, _ = q.shape
+    s_len = k.shape[1]
+
+    def _pad(x: jax.Array, pad_len: int) -> jax.Array:
+        return jnp.pad(x, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+
+    padded_q_len = ((q_len + 3) // 4) * 4
+    padded_s_len = ((s_len + 3) // 4) * 4
+
+    pad_q = padded_q_len - q_len
+    pad_s = padded_s_len - s_len
+
+    q_p = _pad(q, pad_q)
+    k_p = _pad(k, pad_s)
+    v_p = _pad(v, pad_s)
+
+    base_mask = jnp.ones((1, 1, padded_q_len, padded_s_len), dtype=jnp.bool_)
+    base_mask = base_mask.at[:, :, q_len:, :].set(False)
+    base_mask = base_mask.at[:, :, :, s_len:].set(False)
+
+    if attention_mask is not None:
+        key_mask = attention_mask.astype(jnp.bool_)
+        if pad_s:
+            key_mask = jnp.pad(key_mask, ((0, 0), (0, pad_s)), constant_values=False)
+        base_mask = base_mask & key_mask[:, None, None, :]
+
+    attn_out = jax.nn.dot_product_attention(
+        query=q_p,
+        key=k_p,
+        value=v_p,
+        mask=base_mask,
+        bias=None,
+        implementation="cudnn",
+        is_causal=False,
+    )
+
+    return attn_out[:, :q_len, :, :]
+
+
+def _rotate_half(x: jax.Array) -> jax.Array:
+    original_shape = x.shape
+    x = x.reshape(original_shape[:-1] + (-1, 2))
+    x1, x2 = x[..., 0], x[..., 1]
+    return jnp.stack([-x2, x1], axis=-1).reshape(original_shape)

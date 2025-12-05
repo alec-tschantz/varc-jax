@@ -1,18 +1,17 @@
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Iterable
+from typing import Dict, List, Optional, Tuple
 
+import jax.numpy as jnp
 import numpy as np
-import torch
-from torch.utils.data import Dataset
 
 IGNORE_INDEX = 10
 PAD_INDEX = 11
 MAX_SIZE = 30
 
 
-class ARCDataset(Dataset):
+class Dataset:
     def __init__(
         self,
         path: Path,
@@ -25,18 +24,22 @@ class ARCDataset(Dataset):
         resolution_enabled: bool = True,
         fix_scale_factor: int = 2,
         extra_train_path: Optional[Path] = None,
-        seed: int = 0
+        seed: int = 0,
+        batch_size: int = 256,
+        shuffle: bool = True,
     ) -> None:
         self.rng = random.Random(seed)
         self.path = Path(path)
         self.max_size = max_size
         self.subset = subset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
 
         self.translation_enabled = translation_enabled
         self.resolution_enabled = resolution_enabled
         self.fix_scale_factor = fix_scale_factor
 
-        self.samples: List[Dict[str, torch.Tensor]] = []
+        self.samples: List[Dict[str, object]] = []
         self.task_lookup: Dict[str, int] = (
             dict(task_lookup) if task_lookup is not None else {}
         )
@@ -88,22 +91,30 @@ class ARCDataset(Dataset):
                 )
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.samples) // self.batch_size
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __iter__(self):
+        indices = list(range(len(self.samples)))
+        if self.shuffle:
+            self.rng.shuffle(indices)
+
+        usable = len(indices) - (len(indices) % self.batch_size)
+        for start in range(0, usable, self.batch_size):
+            batch_indices = indices[start : start + self.batch_size]
+            batch_items = [self._process_index(i) for i in batch_indices]
+            yield self._stack_batch(batch_items)
+
+    def _process_index(self, idx: int) -> Dict[str, np.ndarray]:
         cur_batch = self.samples[idx]
-        return self.process_per_example(
+        return self._process_example(
             example=cur_batch["example"],
             task_index=cur_batch["task_index"],
             task_name=cur_batch["task_name"],
             example_index=cur_batch["example_index"],
             rng=self.rng,
-            if_translation=self.translation_enabled,
         )
 
-    def process_per_example(
-        self, example, task_index, task_name, example_index, rng, if_translation=True
-    ):
+    def _process_example(self, example, task_index, task_name, example_index, rng):
         max_cur_y = len(example["input"])
         max_cur_x = len(example["input"][0])
         if "output" in example:
@@ -123,14 +134,16 @@ class ARCDataset(Dataset):
                 np.repeat(example["input"], scale_factor, axis=0), scale_factor, axis=1
             ).tolist()
             new_example["output"] = np.repeat(
-                np.repeat(example["output"], scale_factor, axis=0), scale_factor, axis=1
+                np.repeat(example["output"], scale_factor, axis=0),
+                scale_factor,
+                axis=1,
             ).tolist()
             example = new_example
 
         max_cur_x = max_cur_x * scale_factor
         max_cur_y = max_cur_y * scale_factor
 
-        if if_translation:
+        if self.translation_enabled:
             x_offset = (
                 rng.randint(1, max_img_size - max_cur_x)
                 if max_img_size > max_cur_x
@@ -154,61 +167,38 @@ class ARCDataset(Dataset):
                 example["output"], max_size, x_offset, y_offset, output_shape=True
             )
         else:
-            target_grid = torch.full(
-                (max_size, max_size), IGNORE_INDEX, dtype=torch.long
-            )
-            target_mask = torch.zeros((max_size, max_size), dtype=torch.long)
+            target_grid = np.full((max_size, max_size), IGNORE_INDEX, dtype=np.int32)
+            target_mask = np.zeros((max_size, max_size), dtype=np.int32)
             target_h = 0
             target_w = 0
 
-        target_grid = target_grid.clone()
+        target_grid = target_grid.copy()
         target_grid[target_mask == 0] = IGNORE_INDEX
 
-        raw_input = example.get("input", [])
-        raw_output = example.get("output") if "output" in example else None
-
         return {
-            "inputs": input_grid,
-            "attention_mask": input_mask,
-            "targets": target_grid,
-            "task_id": torch.tensor(task_index, dtype=torch.long),
+            "inputs": input_grid.astype(np.int32),
+            "attention_mask": input_mask.astype(np.bool_),
+            "targets": target_grid.astype(np.int32),
+            "task_ids": np.array(task_index, dtype=np.int32),
             "task_name": task_name,
-            "example_index": torch.tensor(example_index, dtype=torch.long),
-            "target_shape": torch.tensor([target_h, target_w], dtype=torch.long),
-            "raw_input": raw_input,
-            "raw_output": raw_output,
-            "offset": (x_offset, y_offset),
-            "scale_factor": scale_factor,
+            "example_index": np.array(example_index, dtype=np.int32),
+            "target_shape": np.array([target_h, target_w], dtype=np.int32),
         }
 
+    def _stack_batch(
+        self, batch_items: List[Dict[str, np.ndarray]]
+    ) -> Dict[str, jnp.ndarray]:
+        inputs = np.stack([item["inputs"] for item in batch_items], axis=0)
+        attention = np.stack([item["attention_mask"] for item in batch_items], axis=0)
+        targets = np.stack([item["targets"] for item in batch_items], axis=0)
+        task_ids = np.stack([item["task_ids"] for item in batch_items], axis=0)
 
-def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    inputs = torch.stack([item["inputs"] for item in batch], dim=0)
-    attention = torch.stack([item["attention_mask"] for item in batch], dim=0)
-    targets = torch.stack([item["targets"] for item in batch], dim=0)
-    task_ids = torch.stack([item["task_id"] for item in batch], dim=0)
-    target_shapes = torch.stack([item["target_shape"] for item in batch], dim=0)
-    example_indices = torch.stack([item["example_index"] for item in batch], dim=0)
-    offset = torch.stack([torch.tensor(item["offset"]) for item in batch], dim=0)
-    scale_factors = torch.stack(
-        [torch.tensor(item["scale_factor"]) for item in batch], dim=0
-    )
-    task_names = [item["task_name"] for item in batch]
-    raw_inputs = [item["raw_input"] for item in batch]
-    raw_outputs = [item["raw_output"] for item in batch]
-    return {
-        "inputs": inputs,
-        "attention_mask": attention,
-        "targets": targets,
-        "task_ids": task_ids,
-        "target_shapes": target_shapes,
-        "example_indices": example_indices,
-        "task_names": task_names,
-        "raw_inputs": raw_inputs,
-        "raw_outputs": raw_outputs,
-        "offset": offset,
-        "scale_factors": scale_factors,
-    }
+        return {
+            "inputs": jnp.asarray(inputs, dtype=jnp.int32),
+            "attention_mask": jnp.asarray(attention, dtype=jnp.bool_),
+            "targets": jnp.asarray(targets, dtype=jnp.int32),
+            "task_ids": jnp.asarray(task_ids, dtype=jnp.int32),
+        }
 
 
 def pad_grid_with_translation(
@@ -217,14 +207,14 @@ def pad_grid_with_translation(
     x_offset: int,
     y_offset: int,
     output_shape: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+) -> Tuple[np.ndarray, np.ndarray, int, int]:
     height = len(grid)
     width = len(grid[0]) if height > 0 else 0
 
-    tensor = torch.full((max_size, max_size), IGNORE_INDEX, dtype=torch.long)
-    mask = torch.zeros((max_size, max_size), dtype=torch.long)
+    tensor = np.full((max_size, max_size), IGNORE_INDEX, dtype=np.int32)
+    mask = np.zeros((max_size, max_size), dtype=np.int32)
 
-    values = torch.tensor(grid, dtype=torch.long)
+    values = np.array(grid, dtype=np.int32)
     tensor[y_offset : y_offset + height, x_offset : x_offset + width] = values
     mask[y_offset : y_offset + height, x_offset : x_offset + width] = 1
 
