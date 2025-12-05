@@ -33,7 +33,7 @@ def _summary(times: Iterable[float]) -> Dict[str, float]:
 @dataclass
 class BenchmarkArgs:
     runs: int = 10
-    warmup: int = 2
+    warmup: int = 10
     config: Config = field(default_factory=Config)
 
 
